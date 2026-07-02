@@ -67,6 +67,7 @@ static inline u8 effective_prio(struct task_struct *p) {
 
 void update_burst_score(struct sched_entity *se) {
 	if (!entity_is_task(se)) return;
+	if (unlikely(!se->bore_stats)) return;
 	struct task_struct *p = task_of(se);
 	u8 prev_prio = effective_prio(p);
 
@@ -81,6 +82,7 @@ void update_burst_score(struct sched_entity *se) {
 }
 
 void update_burst_penalty(struct sched_entity *se) {
+	if (unlikely(!se->bore_stats)) return;
 	se->bore_stats->curr_burst_penalty = calc_burst_penalty(se->bore_stats->burst_time);
 	se->bore_stats->burst_penalty = max(se->bore_stats->prev_burst_penalty, se->bore_stats->curr_burst_penalty);
 	update_burst_score(se);
