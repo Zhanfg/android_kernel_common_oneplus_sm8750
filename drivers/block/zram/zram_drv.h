@@ -22,6 +22,10 @@
 
 #include "zcomp.h"
 
+#ifdef CONFIG_ZRAM_WRITEBACK
+#include "zms.h"
+#endif
+
 #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
 #define ZRAM_LOGICAL_BLOCK_SHIFT 12
@@ -54,14 +58,14 @@ enum zram_pageflags {
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 	ZRAM_INCOMPRESSIBLE, /* none of the algorithms could compress it */
+	ZRAM_UNDER_WB,	/* page is under writeback */
+	ZRAM_PREFETCHED, /* page was brought back by ZMS prefetch */
 
 	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
 	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
 
 	ZRAM_PAGE_ANON,		/* 匿名页 */
 	ZRAM_PAGE_FILE,		/* 文件页 */
-
-	ZRAM_STATE_MIGRATING,	/* page is being migrated on backing device */
 
 	__NR_ZRAM_PAGEFLAGS,
 };
@@ -78,8 +82,7 @@ struct zram_table_entry {
 #ifdef	CONFIG_ZRAM_WRITEBACK
 	struct list_head lru;
 	bool referenced;
-	u8 wb_nr_pages;
-	u8 migration_count;
+	unsigned long prefetch_jiffies;
 #endif
 };
 
@@ -103,11 +106,27 @@ struct zram_stats {
 	atomic64_t writestall;		/* no. of write slow paths */
 	atomic64_t miss_free;		/* no. of missed free */
 #ifdef	CONFIG_ZRAM_WRITEBACK
-	atomic64_t bd_count;		/* no. of pages in backing device */
-	atomic64_t bd_reads;		/* no. of reads from backing device */
-	atomic64_t bd_writes;		/* no. of writes from backing device */
+	atomic64_t bd_count;		/* logical pages on ZMS/backing */
+	atomic64_t bd_compr_data_size;	/* compressed bytes in ZMS */
+	atomic64_t bd_reads;		/* logical page reads from ZMS */
+	atomic64_t bd_writes;		/* logical page writes to ZMS */
 	atomic64_t written_back_pages;
 	atomic64_t reject_reclaim_fail;
+	atomic64_t prefetch_runs;
+	atomic64_t prefetch_candidates;
+	atomic64_t prefetch_submitted;
+	atomic64_t prefetch_moved;
+	atomic64_t prefetch_skipped;
+	atomic64_t prefetch_read_errors;
+	atomic64_t prefetch_prepare_errors;
+	atomic64_t prefetch_snapshot_mismatch;
+	atomic64_t prefetch_no_data;
+	atomic64_t prefetch_alloc_failures;
+	atomic64_t prefetch_hits;
+	atomic64_t prefetch_stale_hits;
+	atomic64_t prefetch_expired;
+	atomic64_t prefetch_reclaimed;
+	atomic64_t prefetch_invalidated;
 #endif
 };
 
@@ -151,18 +170,19 @@ struct zram {
 	bool wb_limit_enable;
 	u64 bd_wb_limit;
 	struct block_device *bdev;
-	unsigned long *bitmap;
-	unsigned long nr_pages;
+	struct zms *zms;
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
-	/* GC fields */
+	/* ZMS GC / compact */
 	struct work_struct gc_work;
 	struct delayed_work gc_periodic_work;
 	atomic_t gc_pending;
 	bool gc_stopping;
-	u32 gc_target_pages;
-	unsigned long gc_scan_cursor;
+	/* Prefetch fault direction */
+	u32 prefetch_last_fault_index;
+	u32 prefetch_prev_fault_index;
+	bool prefetch_fault_valid;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
