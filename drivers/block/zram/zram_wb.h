@@ -11,7 +11,9 @@
 #define ZRAM_ZMS_GC_PARTIAL_PCT		25UL
 #define ZRAM_ZMS_GC_FREE_PCT		15UL
 #define ZRAM_ZMS_WB_MIN_FREE_BLOCKS	8UL
+#define ZRAM_ZMS_WB_MAX_PAGES_PER_OBJ	ZMS_MAX_PAGES_PER_ZSPAGE
 #define ZRAM_WB_BATCH_MAX		32U
+#define ZRAM_WB_GC_AFTER_WRITTEN	64U
 
 #define ZRAM_ZMS_PREFETCH_MAX		2U
 #define ZRAM_PREFETCH_NEIGHBOR_SCAN_MAX	4U
@@ -24,6 +26,7 @@ void zram_init_gc(struct zram *zram);
 void zram_cancel_gc(struct zram *zram);
 void zram_schedule_gc(struct zram *zram);
 int zram_zms_gc_run(struct zram *zram, const char *reason);
+bool zram_zms_writeback_allowed(void);
 #else
 static inline int setup_zram_writeback(void) { return 0; }
 static inline void destroy_zram_writeback(void) {}
@@ -34,6 +37,7 @@ static inline int zram_zms_gc_run(struct zram *zram, const char *reason)
 {
 	return 0;
 }
+static inline bool zram_zms_writeback_allowed(void) { return true; }
 #endif
 
 #endif /* _ZRAM_WRITEBACK_H_ */

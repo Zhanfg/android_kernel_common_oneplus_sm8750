@@ -172,6 +172,7 @@ struct zms {
 	atomic64_t physical_write_failed_pages;
 	atomic64_t bd_stat_read_pages;
 	atomic64_t bd_stat_write_pages;
+	void *account_private;
 	zms_account_write_pages_t account_write_pages;
 	unsigned long dirty_low_pages;
 	unsigned long dirty_high_pages;
@@ -791,7 +792,7 @@ static void zms_account_physical_io(struct zms *zms, unsigned int op,
 		if (account_bd_stat)
 			atomic64_add(pages, &zms->bd_stat_write_pages);
 		if (zms->account_write_pages)
-			zms->account_write_pages(pages);
+			zms->account_write_pages(zms->account_private, pages);
 		return;
 	}
 
@@ -2028,7 +2029,7 @@ static void zms_flush_workfn(struct work_struct *work)
 }
 
 struct zms *zms_create(struct block_device *bdev, unsigned long nr_blocks,
-		       unsigned long nr_handles,
+		       unsigned long nr_handles, void *account_private,
 		       zms_account_write_pages_t account_write_pages)
 {
 	struct zms *zms;
@@ -2047,6 +2048,7 @@ struct zms *zms_create(struct block_device *bdev, unsigned long nr_blocks,
 	zms->nr_blocks = nr_blocks;
 	zms->nr_handles = nr_handles;
 	zms->next_block = ZMS_BLOCK_RESERVED;
+	zms->account_private = account_private;
 	zms->account_write_pages = account_write_pages;
 	spin_lock_init(&zms->pending_lock);
 	spin_lock_init(&zms->alloc_lock);

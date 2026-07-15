@@ -127,6 +127,13 @@ struct zram_stats {
 	atomic64_t prefetch_expired;
 	atomic64_t prefetch_reclaimed;
 	atomic64_t prefetch_invalidated;
+	atomic64_t wb_batches;
+	atomic64_t wb_snapshot_mismatch;
+	atomic64_t wb_space_rejections;
+	atomic64_t gc_runs;
+	atomic64_t gc_compacts;
+	atomic64_t gc_flushes;
+	atomic64_t physical_write_pages;
 #endif
 };
 

@@ -23,7 +23,7 @@ static inline unsigned int zms_size_to_class(size_t size)
 	return (aligned / ZMS_CLASS_SIZE) - 1;
 }
 
-typedef void (*zms_account_write_pages_t)(unsigned long pages);
+typedef void (*zms_account_write_pages_t)(void *private, unsigned long pages);
 
 struct zms_io {
 	bool submitted;
@@ -112,7 +112,7 @@ struct zms_load_ref {
 };
 
 struct zms *zms_create(struct block_device *bdev, unsigned long nr_blocks,
-		       unsigned long nr_handles,
+		       unsigned long nr_handles, void *account_private,
 		       zms_account_write_pages_t account_write_pages);
 int zms_set_nr_handles(struct zms *zms, unsigned long nr_handles);
 void zms_destroy(struct zms *zms);

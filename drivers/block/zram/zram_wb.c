@@ -7,16 +7,27 @@
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/sysms_finder.h>
 #include <linux/workqueue.h>
 
 #include "zram_wb.h"
 #include "zms.h"
 
+bool zram_zms_writeback_allowed(void)
+{
+	if (system_entering_hibernation())
+		return false;
+	return true;
+}
+
 static bool zram_zms_gc_should_run(const struct zms_stats *stats)
 {
 	unsigned long partial_pct;
 	unsigned long free_pct;
+
+	if (!zram_zms_writeback_allowed())
+		return false;
 
 	if (!stats || !stats->nr_blocks || !stats->used_blocks)
 		return false;
@@ -50,6 +61,10 @@ int zram_zms_gc_run(struct zram *zram, const char *reason)
 
 	if (!zram || !zram->zms)
 		return 0;
+	if (!zram_zms_writeback_allowed())
+		return 0;
+
+	atomic64_inc(&zram->stats.gc_runs);
 
 	ret = zms_get_stats(zram->zms, &stats);
 	if (ret)
@@ -60,6 +75,8 @@ int zram_zms_gc_run(struct zram *zram, const char *reason)
 
 	if (stats.dirty_blocks) {
 		flush_ret = zms_flush_all(zram->zms, GFP_NOIO, &io);
+		if (!flush_ret)
+			atomic64_inc(&zram->stats.gc_flushes);
 		if (flush_ret) {
 			pr_warn_ratelimited(
 				"zms gc flush failed reason=%s dirty=%lu ret=%d\n",
@@ -69,6 +86,8 @@ int zram_zms_gc_run(struct zram *zram, const char *reason)
 	}
 
 	ret = zms_compact(zram->zms, GFP_NOIO, &io);
+	if (!ret || ret == -EAGAIN)
+		atomic64_inc(&zram->stats.gc_compacts);
 	if (ret && ret != -EAGAIN)
 		pr_warn_ratelimited(
 			"zms gc failed reason=%s used=%lu free=%lu partial=%lu dirty=%lu ret=%d\n",
@@ -86,7 +105,7 @@ int zram_zms_gc_run(struct zram *zram, const char *reason)
 static void zram_gc_workfn(struct work_struct *work)
 {
 	struct zram *zram = container_of(work, struct zram, gc_work);
-	int ret;
+	int ret = 0;
 
 	if (READ_ONCE(zram->gc_stopping))
 		goto out;
@@ -94,21 +113,14 @@ static void zram_gc_workfn(struct work_struct *work)
 	down_read(&zram->init_lock);
 	if (zram->disksize && zram->zms)
 		ret = zram_zms_gc_run(zram, "scheduled");
-	else
-		ret = 0;
 	up_read(&zram->init_lock);
 
-	/*
-	 * Compact may return -EAGAIN when time-limited. Keep going while
-	 * work is still pending and device is alive.
-	 */
 	if (ret == -EAGAIN && !READ_ONCE(zram->gc_stopping) &&
 	    atomic_read(&zram->gc_pending))
 		queue_work(system_unbound_wq, &zram->gc_work);
 
 out:
-	if (atomic_dec_and_test(&zram->gc_pending))
-		/* nothing */;
+	atomic_dec(&zram->gc_pending);
 }
 
 static void zram_gc_periodic_workfn(struct work_struct *work)
@@ -119,8 +131,8 @@ static void zram_gc_periodic_workfn(struct work_struct *work)
 	if (READ_ONCE(zram->gc_stopping))
 		return;
 
-	/* Prefer compact while charging; still run lightly otherwise. */
-	if (check_charging_state() || !check_game_pid())
+	if (zram_zms_writeback_allowed() &&
+	    (check_charging_state() || !check_game_pid()))
 		zram_schedule_gc(zram);
 
 	if (!READ_ONCE(zram->gc_stopping))
@@ -131,6 +143,8 @@ static void zram_gc_periodic_workfn(struct work_struct *work)
 void zram_schedule_gc(struct zram *zram)
 {
 	if (!zram || !zram->zms || READ_ONCE(zram->gc_stopping))
+		return;
+	if (!zram_zms_writeback_allowed())
 		return;
 
 	if (atomic_inc_return(&zram->gc_pending) == 1)
