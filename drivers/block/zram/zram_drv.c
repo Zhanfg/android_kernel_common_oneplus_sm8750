@@ -139,6 +139,16 @@ static unsigned int num_devices = 1;
  */
 static size_t huge_class_size;
 
+#ifdef CONFIG_ZRAM_WRITEBACK
+/*
+ * Neighbor prefetch default ON. Disable with zram.zms_prefetch=0 to isolate.
+ */
+static bool zram_zms_prefetch_enabled = true;
+module_param_named(zms_prefetch, zram_zms_prefetch_enabled, bool, 0644);
+MODULE_PARM_DESC(zms_prefetch,
+		 "Enable ZMS neighbor prefetch on writeback fault-in (default: on)");
+#endif
+
 static const struct block_device_operations zram_devops;
 
 static int zram_read_page(struct zram *zram, struct page *page, u32 index,
@@ -283,6 +293,41 @@ static void zram_clear_under_wb(struct zram *zram, u32 index)
 	zram_clear_flag(zram, index, ZRAM_UNDER_WB);
 	smp_mb();
 	wake_up_bit(&zram->table[index].flags, ZRAM_UNDER_WB);
+}
+
+static bool zram_wait_under_wb(struct zram *zram, u32 index)
+{
+	/*
+	 * Bounded wait. Never force-clear UNDER_WB from a waiter: that steals
+	 * writeback/prefetch ownership and reopens page-loss windows.
+	 */
+	if (!wait_on_bit_timeout(&zram->table[index].flags, ZRAM_UNDER_WB,
+				 TASK_UNINTERRUPTIBLE,
+				 ZRAM_UNDER_WB_WAIT_TIMEOUT))
+		return true;
+
+	pr_err_ratelimited(
+		"zram UNDER_WB timeout index=%u flags=0x%lx (not clearing)\n",
+		index, zram->table[index].flags);
+	return false;
+}
+
+/*
+ * Retry a few bounded waits. Still never steals UNDER_WB; on final timeout
+ * kick GC in case workers are stuck behind a full/fragmented ZMS.
+ */
+static int zram_wait_under_wb_retry(struct zram *zram, u32 index)
+{
+	int retries = 0;
+
+	while (retries < ZRAM_UNDER_WB_WAIT_RETRIES) {
+		if (zram_wait_under_wb(zram, index))
+			return 0;
+		retries++;
+		zram_schedule_gc(zram);
+		cond_resched();
+	}
+	return -EBUSY;
 }
 
 static size_t zram_get_obj_size(struct zram *zram, u32 index)
@@ -767,6 +812,20 @@ static bool zram_has_writeback_slots(struct zram *zram)
 	return atomic64_read(&zram->stats.bd_count) != 0;
 }
 
+static void zram_drain_prefetch(struct zram *zram)
+{
+	unsigned long timeout = jiffies + HZ;
+
+	while (atomic_read(&zram->prefetch_inflight) &&
+	       time_before(jiffies, timeout)) {
+		flush_workqueue(system_unbound_wq);
+		cond_resched();
+	}
+	if (atomic_read(&zram->prefetch_inflight))
+		pr_warn("zram prefetch still inflight=%d after drain\n",
+			atomic_read(&zram->prefetch_inflight));
+}
+
 static void reset_bdev(struct zram *zram)
 {
 	struct block_device *bdev;
@@ -775,6 +834,7 @@ static void reset_bdev(struct zram *zram)
 		return;
 
 	zram_cancel_gc(zram);
+	zram_drain_prefetch(zram);
 	zms_destroy(zram->zms);
 	zram->zms = NULL;
 
@@ -911,6 +971,7 @@ static ssize_t backing_dev_store(struct device *dev,
 	zram->bdev = bdev;
 	zram->backing_dev = backing_dev;
 	zram->zms = zms;
+	atomic_set(&zram->prefetch_inflight, 0);
 
 	zram_init_gc(zram);
 	queue_delayed_work(system_unbound_wq, &zram->gc_periodic_work,
@@ -956,6 +1017,22 @@ struct zram_wb_item {
 	void *data;
 };
 
+/* One async writeback wave (≤ ZRAM_WB_BATCH_MAX inflight). */
+struct zram_wb_wave {
+	atomic_t remaining;
+	atomic_t successes;
+	atomic_t enospc;
+	struct completion done;
+};
+
+/* Async ZMS writeback request (one compressed object). */
+struct zram_wb_async_req {
+	struct work_struct work;
+	struct zram *zram;
+	struct zram_wb_wave *wave;
+	struct zram_wb_item item;
+};
+
 struct zram_work {
 	struct work_struct work;
 	struct zram *zram;
@@ -990,6 +1067,7 @@ struct zram_zms_prefetch_work {
 };
 
 static struct workqueue_struct *zram_read_wq;
+static struct workqueue_struct *zram_wb_wq;
 
 static void zram_clear_prefetched(struct zram *zram, u32 index)
 {
@@ -1353,13 +1431,135 @@ static int read_from_zms_sync(struct zram *zram, struct page *page,
 	return work.error;
 }
 
+static void zram_wb_abort_item(struct zram *zram, u32 index)
+{
+	zram_slot_lock(zram, index);
+	if (zram_test_flag(zram, index, ZRAM_UNDER_WB))
+		zram_clear_under_wb(zram, index);
+	zram_clear_flag(zram, index, ZRAM_IDLE);
+	zram_clear_flag(zram, index, ZRAM_PP_SLOT);
+	zram_slot_unlock(zram, index);
+}
+
+static void zram_wb_wave_done(struct zram_wb_wave *wave)
+{
+	if (atomic_dec_and_test(&wave->remaining))
+		complete(&wave->done);
+}
+
+/*
+ * Async worker: zms_store + commit. Submitter only prepares payload and waits
+ * on the current wave (≤ ZRAM_WB_BATCH_MAX inflight).
+ */
+static void zram_wb_async_workfn(struct work_struct *work)
+{
+	struct zram_wb_async_req *req =
+		container_of(work, struct zram_wb_async_req, work);
+	struct zram *zram = req->zram;
+	struct zram_wb_wave *wave = req->wave;
+	struct zram_wb_item *it = &req->item;
+	struct zms_io io;
+	u32 cur = it->index;
+	bool huge, incompressible;
+	u32 prio;
+	int err;
+
+	if (!down_read_trylock(&zram->init_lock)) {
+		zram_wb_abort_item(zram, cur);
+		goto out_free;
+	}
+	if (!init_done(zram) || !zram->zms) {
+		up_read(&zram->init_lock);
+		zram_wb_abort_item(zram, cur);
+		goto out_free;
+	}
+
+	zram_slot_lock(zram, cur);
+	if (!zram_writeback_snapshot_matches(zram, cur, &it->snapshot)) {
+		zram_clear_under_wb(zram, cur);
+		zram_clear_flag(zram, cur, ZRAM_IDLE);
+		zram_slot_unlock(zram, cur);
+		atomic64_inc(&zram->stats.wb_snapshot_mismatch);
+		up_read(&zram->init_lock);
+		goto out_free;
+	}
+	zram_slot_unlock(zram, cur);
+
+	err = zms_store(zram->zms, it->handle, it->data, it->size, GFP_NOIO,
+			&io);
+	if (err) {
+		zram_wb_abort_item(zram, cur);
+		if (err == -ENOSPC) {
+			atomic_inc(&wave->enospc);
+			zram_schedule_gc(zram);
+		}
+		up_read(&zram->init_lock);
+		goto out_free;
+	}
+
+	zram_slot_lock(zram, cur);
+	if (!zram_writeback_snapshot_matches(zram, cur, &it->snapshot)) {
+		zram_clear_under_wb(zram, cur);
+		zram_clear_flag(zram, cur, ZRAM_IDLE);
+		zram_slot_unlock(zram, cur);
+		zms_free(zram->zms, it->handle);
+		atomic64_inc(&zram->stats.wb_snapshot_mismatch);
+		up_read(&zram->init_lock);
+		goto out_free;
+	}
+
+	prio = zram_get_priority(zram, cur);
+	huge = zram_test_flag(zram, cur, ZRAM_HUGE);
+	incompressible = zram_test_flag(zram, cur, ZRAM_INCOMPRESSIBLE);
+	/*
+	 * free_page keeps UNDER_WB. Install WB metadata first, then clear
+	 * UNDER_WB so waiters never see an empty hole.
+	 */
+	zram_free_page(zram, cur);
+	zram_set_flag(zram, cur, ZRAM_WB);
+	if (huge) {
+		zram_set_flag(zram, cur, ZRAM_HUGE);
+		atomic64_inc(&zram->stats.huge_pages);
+	}
+	if (incompressible)
+		zram_set_flag(zram, cur, ZRAM_INCOMPRESSIBLE);
+	zram_set_handle(zram, cur, it->handle);
+	zram_set_obj_size(zram, cur, it->size);
+	zram_set_priority(zram, cur, prio);
+	atomic64_inc(&zram->stats.pages_stored);
+	atomic64_inc(&zram->stats.bd_count);
+	atomic64_inc(&zram->stats.bd_writes);
+	atomic64_add(it->size, &zram->stats.bd_compr_data_size);
+	atomic64_inc(&zram->stats.written_back_pages);
+	atomic_inc(&wave->successes);
+	zram_clear_under_wb(zram, cur);
+	zram_slot_unlock(zram, cur);
+	up_read(&zram->init_lock);
+
+out_free:
+	kfree(it->data);
+	zram_wb_wave_done(wave);
+	kfree(req);
+}
+
+/*
+ * Async batched writeback with restored #3 window semantics:
+ *  - prepare compressed payload under slot lock
+ *  - queue at most ZRAM_WB_BATCH_MAX workers per wave
+ *  - space-precheck each wave; stop on ENOSPC / limit
+ *  - wait for the wave before starting the next
+ * Shrinker is not blocked inside zms_store; only waits for workers.
+ *
+ * Returns number of successfully written pages (>=0), or negative errno
+ * when nothing could be submitted / hard failure before any success.
+ */
 static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 {
 	struct zram_pp_slot *pps;
-	struct zram_wb_item *items = NULL;
-	unsigned int i;
+	struct zms_stats stats = {};
+	struct zram_wb_wave wave;
 	int ret = 0;
-	unsigned long written = 0;
+	unsigned long total_success = 0;
 	bool stop = false;
 
 	if (!atomic_read(&ctl->num_pp_slots))
@@ -1368,46 +1568,60 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 		return -ENXIO;
 	if (!zram_zms_writeback_allowed())
 		return -EBUSY;
-
-	items = kcalloc(ZRAM_WB_BATCH_MAX, sizeof(*items), GFP_KERNEL);
-	if (!items)
-		return -ENOMEM;
-	for (i = 0; i < ZRAM_WB_BATCH_MAX; i++) {
-		items[i].data = kmalloc(PAGE_SIZE, GFP_KERNEL);
-		if (!items[i].data) {
-			ret = -ENOMEM;
-			goto free_items;
-		}
-	}
+	if (!zram_wb_wq)
+		return -ENODEV;
 
 	while (!stop && (pps = select_pp_slot(ctl))) {
-		struct zms_stats stats = {};
+		struct zram_wb_async_req *reqs[ZRAM_WB_BATCH_MAX];
 		unsigned int batch_count = 0;
-		unsigned int batch_limit = ZRAM_WB_BATCH_MAX;
+		unsigned int i;
 		int err;
 
-		/* put current pps back into flow by processing from it first */
-		/* collect a batch starting with current pps */
+		/* ---- collect one wave (≤ ZRAM_WB_BATCH_MAX) ---- */
 		for (;;) {
+			struct zram_wb_async_req *req;
 			u32 index = pps->index;
-			struct zram_wb_item *item;
 
 			remove_pp_slot_from_ctl(pps);
 
 			spin_lock(&zram->wb_limit_lock);
 			if (zram->wb_limit_enable && !zram->bd_wb_limit) {
 				spin_unlock(&zram->wb_limit_lock);
-				ret = -EIO;
 				free_pp_slot(zram, pps);
 				if (atomic_dec_and_test(&ctl->num_pp_slots))
 					complete(&ctl->all_done);
+				ret = -EIO;
 				stop = true;
 				break;
 			}
 			spin_unlock(&zram->wb_limit_lock);
 
-			item = &items[batch_count];
+			req = kzalloc(sizeof(*req), GFP_NOIO | __GFP_NOWARN);
+			if (!req) {
+				free_pp_slot(zram, pps);
+				if (atomic_dec_and_test(&ctl->num_pp_slots))
+					complete(&ctl->all_done);
+				ret = -ENOMEM;
+				stop = true;
+				break;
+			}
+			req->item.data = kmalloc(PAGE_SIZE,
+						 GFP_NOIO | __GFP_NOWARN);
+			if (!req->item.data) {
+				kfree(req);
+				free_pp_slot(zram, pps);
+				if (atomic_dec_and_test(&ctl->num_pp_slots))
+					complete(&ctl->all_done);
+				ret = -ENOMEM;
+				stop = true;
+				break;
+			}
+
 			zram_slot_lock(zram, index);
+			/*
+			 * scan sets ZRAM_PP_SLOT then drops the lock; slot may
+			 * change. Only post-process slots that still carry it.
+			 */
 			if (!zram_test_flag(zram, index, ZRAM_PP_SLOT) ||
 			    zram_test_flag(zram, index, ZRAM_WB) ||
 			    zram_test_flag(zram, index, ZRAM_SAME) ||
@@ -1416,41 +1630,45 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 				free_pp_slot(zram, pps);
 				if (atomic_dec_and_test(&ctl->num_pp_slots))
 					complete(&ctl->all_done);
+				kfree(req->item.data);
+				kfree(req);
 				goto next_collect;
 			}
 
 			zram_set_flag(zram, index, ZRAM_UNDER_WB);
 			zram_set_flag(zram, index, ZRAM_IDLE);
-			item->prio = zram_get_priority(zram, index);
-			item->huge = zram_test_flag(zram, index, ZRAM_HUGE);
-			item->incompressible = zram_test_flag(zram, index,
-							       ZRAM_INCOMPRESSIBLE);
-			err = zram_read_compressed_page(zram, index, item->data,
-							&item->size);
+			req->item.prio = zram_get_priority(zram, index);
+			req->item.huge = zram_test_flag(zram, index, ZRAM_HUGE);
+			req->item.incompressible =
+				zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE);
+			err = zram_read_compressed_page(zram, index,
+							req->item.data,
+							&req->item.size);
 			if (!err)
 				zram_take_wb_snapshot(zram, index,
-						      &item->snapshot);
+						      &req->item.snapshot);
 			zram_slot_unlock(zram, index);
 			if (err) {
-				zram_slot_lock(zram, index);
-				zram_clear_under_wb(zram, index);
-				zram_clear_flag(zram, index, ZRAM_IDLE);
-				zram_slot_unlock(zram, index);
+				zram_wb_abort_item(zram, index);
 				free_pp_slot(zram, pps);
 				if (atomic_dec_and_test(&ctl->num_pp_slots))
 					complete(&ctl->all_done);
+				kfree(req->item.data);
+				kfree(req);
 				goto next_collect;
 			}
 
-			item->index = index;
-			item->handle = (unsigned long)index + 1;
-			/* pps ownership transferred; free after commit path */
-			kfree(pps);
+			req->item.index = index;
+			req->item.handle = (unsigned long)index + 1;
+			req->zram = zram;
+			/* free_pp_slot clears PP_SLOT; worker owns UNDER_WB */
+			free_pp_slot(zram, pps);
 			if (atomic_dec_and_test(&ctl->num_pp_slots))
 				complete(&ctl->all_done);
-			batch_count++;
+
+			reqs[batch_count++] = req;
 next_collect:
-			if (stop || batch_count >= batch_limit)
+			if (stop || batch_count >= ZRAM_WB_BATCH_MAX)
 				break;
 			pps = select_pp_slot(ctl);
 			if (!pps)
@@ -1460,110 +1678,69 @@ next_collect:
 		if (!batch_count)
 			break;
 
+		/* ---- B: honor space precheck for this wave ---- */
 		err = zram_zms_writeback_check_space(zram, batch_count, &stats);
 		if (err) {
-			/* release UNDER_WB for collected slots */
 			for (i = 0; i < batch_count; i++) {
-				u32 cur = items[i].index;
-
-				zram_slot_lock(zram, cur);
-				zram_clear_under_wb(zram, cur);
-				zram_clear_flag(zram, cur, ZRAM_IDLE);
-				zram_slot_unlock(zram, cur);
+				zram_wb_abort_item(zram, reqs[i]->item.index);
+				kfree(reqs[i]->item.data);
+				kfree(reqs[i]);
 			}
 			ret = err;
 			stop = true;
 			break;
 		}
 
-		atomic64_inc(&zram->stats.wb_batches);
+		/* ---- submit wave, wait for completion ---- */
+		init_completion(&wave.done);
+		atomic_set(&wave.remaining, batch_count);
+		atomic_set(&wave.successes, 0);
+		atomic_set(&wave.enospc, 0);
+
 		for (i = 0; i < batch_count; i++) {
-			struct zram_wb_item *it = &items[i];
-			struct zms_io io;
-			u32 cur = it->index;
-			bool huge, incompressible;
-			u32 prio;
-
-			zram_slot_lock(zram, cur);
-			if (!zram_writeback_snapshot_matches(zram, cur,
-							     &it->snapshot)) {
-				zram_clear_under_wb(zram, cur);
-				zram_clear_flag(zram, cur, ZRAM_IDLE);
-				zram_slot_unlock(zram, cur);
-				atomic64_inc(&zram->stats.wb_snapshot_mismatch);
-				continue;
-			}
-			zram_slot_unlock(zram, cur);
-
-			err = zms_store(zram->zms, it->handle, it->data,
-					it->size, GFP_NOIO, &io);
-			if (err) {
-				zram_slot_lock(zram, cur);
-				zram_clear_under_wb(zram, cur);
-				zram_clear_flag(zram, cur, ZRAM_IDLE);
-				zram_slot_unlock(zram, cur);
-				ret = err;
-				if (err == -ENOSPC) {
-					zram_schedule_gc(zram);
-					stop = true;
-					/* clear remaining under_wb */
-					for (i = i + 1; i < batch_count; i++) {
-						u32 r = items[i].index;
-
-						zram_slot_lock(zram, r);
-						zram_clear_under_wb(zram, r);
-						zram_clear_flag(zram, r, ZRAM_IDLE);
-						zram_slot_unlock(zram, r);
-					}
-					break;
+			reqs[i]->wave = &wave;
+			INIT_WORK(&reqs[i]->work, zram_wb_async_workfn);
+			if (!queue_work(zram_wb_wq, &reqs[i]->work)) {
+				zram_wb_abort_item(zram, reqs[i]->item.index);
+				kfree(reqs[i]->item.data);
+				kfree(reqs[i]);
+				zram_wb_wave_done(&wave);
+				ret = -ENOMEM;
+				/* remaining workers still run; wait below */
+				for (i = i + 1; i < batch_count; i++) {
+					zram_wb_abort_item(zram,
+							   reqs[i]->item.index);
+					kfree(reqs[i]->item.data);
+					kfree(reqs[i]);
+					zram_wb_wave_done(&wave);
 				}
-				continue;
+				stop = true;
+				break;
 			}
-
-			zram_slot_lock(zram, cur);
-			if (!zram_writeback_snapshot_matches(zram, cur,
-							     &it->snapshot)) {
-				zram_clear_under_wb(zram, cur);
-				zram_clear_flag(zram, cur, ZRAM_IDLE);
-				zram_slot_unlock(zram, cur);
-				zms_free(zram->zms, it->handle);
-				atomic64_inc(&zram->stats.wb_snapshot_mismatch);
-				continue;
-			}
-
-			prio = zram_get_priority(zram, cur);
-			huge = zram_test_flag(zram, cur, ZRAM_HUGE);
-			incompressible = zram_test_flag(zram, cur,
-							ZRAM_INCOMPRESSIBLE);
-			zram_clear_prefetched(zram, cur);
-			zram_free_page(zram, cur);
-			zram_clear_under_wb(zram, cur);
-			zram_set_flag(zram, cur, ZRAM_WB);
-			if (huge) {
-				zram_set_flag(zram, cur, ZRAM_HUGE);
-				atomic64_inc(&zram->stats.huge_pages);
-			}
-			if (incompressible)
-				zram_set_flag(zram, cur, ZRAM_INCOMPRESSIBLE);
-			zram_set_handle(zram, cur, it->handle);
-			zram_set_obj_size(zram, cur, it->size);
-			zram_set_priority(zram, cur, prio);
-			atomic64_inc(&zram->stats.pages_stored);
-			atomic64_inc(&zram->stats.bd_count);
-			atomic64_inc(&zram->stats.bd_writes);
-			atomic64_add(it->size, &zram->stats.bd_compr_data_size);
-			atomic64_inc(&zram->stats.written_back_pages);
-			/* physical limit is charged in account_write_pages */
-			zram_slot_unlock(zram, cur);
-			written++;
 		}
 
-		if (written && (written % ZRAM_WB_GC_AFTER_WRITTEN) == 0)
-			zram_schedule_gc(zram);
+		wait_for_completion(&wave.done);
+
+		{
+			unsigned int wave_ok = atomic_read(&wave.successes);
+
+			total_success += wave_ok;
+			atomic64_inc(&zram->stats.wb_batches);
+
+			if (wave_ok &&
+			    (total_success % ZRAM_WB_GC_AFTER_WRITTEN) == 0)
+				zram_schedule_gc(zram);
+
+			/* worker-side ENOSPC: stop further waves */
+			if (atomic_read(&wave.enospc)) {
+				ret = -ENOSPC;
+				stop = true;
+			}
+		}
 		cond_resched();
 	}
 
-	/* Drop any unprocessed leftovers. */
+	/* Drop any unprocessed leftovers (precheck-stop / limit / OOM). */
 	while ((pps = select_pp_slot(ctl))) {
 		remove_pp_slot_from_ctl(pps);
 		free_pp_slot(zram, pps);
@@ -1574,15 +1751,8 @@ next_collect:
 		complete(&ctl->all_done);
 	wait_for_completion(&ctl->all_done);
 
-	if (written || ret == -ENOSPC)
-		zram_schedule_gc(zram);
-
-free_items:
-	if (items) {
-		for (i = 0; i < ZRAM_WB_BATCH_MAX; i++)
-			kfree(items[i].data);
-		kfree(items);
-	}
+	if (total_success)
+		return (int)total_success;
 	return ret;
 }
 
@@ -1767,32 +1937,33 @@ static ssize_t writeback_store(struct device *dev,
 			continue;
 		}
 
-		if (!strcmp(param, "page_indexes")) {
-			err = parse_page_indexes(val, nr_pages, &lo, &hi);
-			if (err) {
-				ret = err;
-				goto release_init_lock;
+			if (!strcmp(param, "page_indexes")) {
+				err = parse_page_indexes(val, nr_pages, &lo, &hi);
+				if (err) {
+					ret = err;
+					goto release_init_lock;
+				}
+
+				scan_slots_for_writeback(zram, mode, lo, hi, ctl);
+				continue;
 			}
-
-			scan_slots_for_writeback(zram, mode, lo, hi, ctl);
-			continue;
 		}
-	}
 
-	if (!atomic_read(&ctl->num_pp_slots))
-		complete(&ctl->all_done);
+		if (!atomic_read(&ctl->num_pp_slots))
+			complete(&ctl->all_done);
 
-	err = zram_writeback_slots(zram, ctl);
-	if (err)
-		ret = err;
+		/* >=0: pages written; <0: hard error with zero success */
+		err = zram_writeback_slots(zram, ctl);
+		if (err < 0)
+			ret = err;
 
 release_init_lock:
-	release_pp_ctl(zram, ctl);
-	atomic_set(&zram->pp_in_progress, 0);
-	up_read(&zram->init_lock);
+		release_pp_ctl(zram, ctl);
+		atomic_set(&zram->pp_in_progress, 0);
+		up_read(&zram->init_lock);
 
-	return ret;
-}
+		return ret;
+	}
 
 static int zram_store_prefetched_item(struct zram *zram,
 				      struct zram_prefetch_item *item,
@@ -1800,14 +1971,13 @@ static int zram_store_prefetched_item(struct zram *zram,
 {
 	unsigned long handle;
 	void *dst;
-	int ret = 0;
 
 	if (!size || size > PAGE_SIZE)
 		return -EINVAL;
 
 	handle = zs_malloc(zram->mem_pool, size, GFP_NOIO);
-	if (!handle)
-		return -ENOMEM;
+	if (IS_ERR_VALUE(handle))
+		return PTR_ERR((void *)handle);
 	if (!zram_can_store_page(zram)) {
 		zs_free(zram->mem_pool, handle);
 		return -ENOMEM;
@@ -1827,25 +1997,43 @@ static int zram_store_prefetched_item(struct zram *zram,
 		return -EAGAIN;
 	}
 
-	/* free WB object and install resident zs object */
-	zram_clear_flag(zram, item->index, ZRAM_WB);
-	zms_free(zram->zms, item->handle);
-	atomic64_dec(&zram->stats.bd_count);
-	atomic64_sub(item->size, &zram->stats.bd_compr_data_size);
+	/*
+	 * Serialize against readers via UNDER_WB. Intermediate state must not
+	 * look like a valid zs object (clear handle/size while UNDER_WB).
+	 */
+	zram_set_flag(zram, item->index, ZRAM_UNDER_WB);
+	{
+		bool was_huge = zram_test_flag(zram, item->index, ZRAM_HUGE);
 
-	zram_set_handle(zram, item->index, handle);
-	zram_set_obj_size(zram, item->index, size);
-	zram_set_priority(zram, item->index, item->prio);
-	if (item->huge) {
-		zram_set_flag(zram, item->index, ZRAM_HUGE);
-		atomic64_inc(&zram->stats.huge_pages);
+		zram_clear_flag(zram, item->index, ZRAM_WB);
+		zms_free(zram->zms, item->handle);
+		atomic64_dec(&zram->stats.bd_count);
+		atomic64_sub(item->size, &zram->stats.bd_compr_data_size);
+		zram_set_handle(zram, item->index, 0);
+		zram_set_obj_size(zram, item->index, 0);
+
+		if (was_huge) {
+			zram_clear_flag(zram, item->index, ZRAM_HUGE);
+			atomic64_dec(&zram->stats.huge_pages);
+		}
+		if (item->huge) {
+			zram_set_flag(zram, item->index, ZRAM_HUGE);
+			atomic64_inc(&zram->stats.huge_pages);
+		}
+		if (item->incompressible)
+			zram_set_flag(zram, item->index, ZRAM_INCOMPRESSIBLE);
+		else
+			zram_clear_flag(zram, item->index, ZRAM_INCOMPRESSIBLE);
+
+		zram_set_handle(zram, item->index, handle);
+		zram_set_obj_size(zram, item->index, size);
+		zram_set_priority(zram, item->index, item->prio);
+		atomic64_add(size, &zram->stats.compr_data_size);
+		zram_set_prefetched(zram, item->index);
 	}
-	if (item->incompressible)
-		zram_set_flag(zram, item->index, ZRAM_INCOMPRESSIBLE);
-	atomic64_add(size, &zram->stats.compr_data_size);
-	zram_set_prefetched(zram, item->index);
+	zram_clear_under_wb(zram, item->index);
 	zram_slot_unlock(zram, item->index);
-	return ret;
+	return 0;
 }
 
 static int zram_prefetch_selected_items(struct zram *zram,
@@ -1906,20 +2094,25 @@ static void zram_zms_prefetch_workfn(struct work_struct *work)
 	unsigned long moved = 0, skipped = 0, read_errors = 0;
 
 	atomic64_inc(&zram->stats.prefetch_runs);
-	down_read(&zram->init_lock);
-	if (init_done(zram) && zram->zms)
-		zram_prefetch_selected_items(zram, prefetch->items,
-					     prefetch->count, &moved,
-					     &skipped, &read_errors);
-	else
+	/* trylock avoids deadlock with reset_bdev drain under init_lock write */
+	if (down_read_trylock(&zram->init_lock)) {
+		if (init_done(zram) && zram->zms && zram_zms_writeback_allowed())
+			zram_prefetch_selected_items(zram, prefetch->items,
+						     prefetch->count, &moved,
+						     &skipped, &read_errors);
+		else
+			skipped = prefetch->count;
+		up_read(&zram->init_lock);
+	} else {
 		skipped = prefetch->count;
-	up_read(&zram->init_lock);
+	}
 
 	atomic64_add(moved, &zram->stats.prefetch_moved);
 	atomic64_add(skipped, &zram->stats.prefetch_skipped);
 	atomic64_add(read_errors, &zram->stats.prefetch_read_errors);
 	if (!moved && !read_errors)
 		atomic64_inc(&zram->stats.prefetch_no_data);
+	atomic_dec(&zram->prefetch_inflight);
 	kfree(prefetch);
 }
 
@@ -1964,6 +2157,10 @@ static void zram_zms_maybe_prefetch(struct zram *zram, u32 index,
 	int i;
 
 	if (!zram || !zram->zms || !handle)
+		return;
+	if (!zram_zms_prefetch_enabled)
+		return;
+	if (atomic_read(&zram->prefetch_inflight) >= 8)
 		return;
 	if (!down_read_trylock(&zram->init_lock))
 		return;
@@ -2029,7 +2226,11 @@ static void zram_zms_maybe_prefetch(struct zram *zram, u32 index,
 	prefetch->zram = zram;
 	INIT_WORK(&prefetch->work, zram_zms_prefetch_workfn);
 	atomic64_add(prefetch->count, &zram->stats.prefetch_submitted);
-	queue_work(system_unbound_wq, &prefetch->work);
+	atomic_inc(&zram->prefetch_inflight);
+	if (!queue_work(system_unbound_wq, &prefetch->work)) {
+		atomic_dec(&zram->prefetch_inflight);
+		kfree(prefetch);
+	}
 	up_read(&zram->init_lock);
 }
 
@@ -2426,11 +2627,38 @@ static ssize_t zms_stat_show(struct device *dev,
 		return -EINVAL;
 	}
 	ret = scnprintf(buf, PAGE_SIZE,
-		"blocks %lu used %lu free %lu objects %lu partial %lu dirty %lu dirty_pages %lu\n"
-		"stored_bytes %llu packed_bytes %llu phys_r %llu phys_w %llu bd_r %llu bd_w %llu\n"
-		"load_hit %lu load_miss %lu hit_pct %lu alloc_run_ok %lu alloc_run_fail %lu\n"
-		"prefetch_runs %llu moved %llu hits %llu stale %llu expired %llu reclaimed %llu\n"
-		"wb_batches %llu snap_mismatch %llu space_rej %llu gc_runs %llu flush %llu compact %llu phys_acct %llu\n",
+		"nr_blocks %lu\n"
+		"used_blocks %lu\n"
+		"free_blocks %lu\n"
+		"objects %lu\n"
+		"partial_blocks %lu\n"
+		"dirty_blocks %lu\n"
+		"dirty_pages %lu\n"
+		"stored_bytes %llu\n"
+		"packed_bytes %llu\n"
+		"physical_read_pages %llu\n"
+		"physical_write_pages %llu\n"
+		"bd_stat_read_pages %llu\n"
+		"bd_stat_write_pages %llu\n"
+		"load_resident_hits %lu\n"
+		"load_disk_misses %lu\n"
+		"load_resident_hit_pct %lu\n"
+		"alloc_run_successes %lu\n"
+		"alloc_run_failures %lu\n"
+		"prefetch_runs %llu\n"
+		"prefetch_moved %llu\n"
+		"prefetch_hits %llu\n"
+		"prefetch_stale_hits %llu\n"
+		"prefetch_expired %llu\n"
+		"prefetch_reclaimed %llu\n"
+		"prefetch_inflight %d\n"
+		"wb_batches %llu\n"
+		"wb_snapshot_mismatch %llu\n"
+		"wb_space_rejections %llu\n"
+		"gc_runs %llu\n"
+		"gc_flushes %llu\n"
+		"gc_compacts %llu\n"
+		"physical_write_accounted %llu\n",
 		s.nr_blocks, s.used_blocks, s.free_blocks, s.objects,
 		s.partial_blocks, s.dirty_blocks, s.dirty_pages,
 		s.stored_bytes, s.packed_bytes,
@@ -2444,6 +2672,7 @@ static ssize_t zms_stat_show(struct device *dev,
 		(u64)atomic64_read(&zram->stats.prefetch_stale_hits),
 		(u64)atomic64_read(&zram->stats.prefetch_expired),
 		(u64)atomic64_read(&zram->stats.prefetch_reclaimed),
+		atomic_read(&zram->prefetch_inflight),
 		(u64)atomic64_read(&zram->stats.wb_batches),
 		(u64)atomic64_read(&zram->stats.wb_snapshot_mismatch),
 		(u64)atomic64_read(&zram->stats.wb_space_rejections),
@@ -2548,10 +2777,28 @@ void zram_free_page(struct zram *zram, size_t index)
 {
 	unsigned long handle;
 	size_t obj_size;
+	bool was_allocated;
 
 #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
 	zram->table[index].ac_time = 0;
 #endif
+
+	/*
+	 * Do NOT clear ZRAM_UNDER_WB here.
+	 *
+	 * Writeback owns UNDER_WB across payload copy / zms_store / free zs /
+	 * install WB handle. Clearing it early creates an empty-slot window:
+	 * readers see free/garbage, writers install new data, then writeback
+	 * reinstalls stale ZMS content (page loss). Waiters can also hang if
+	 * ownership is lost without a wake-up.
+	 *
+	 * free_page only drops the current payload; writeback owner clears
+	 * UNDER_WB after commit (or on abort).
+	 */
+#ifdef CONFIG_ZRAM_WRITEBACK
+	zram_clear_prefetched(zram, index);
+#endif
+
 	/* Remove from LRU list if present */
 	if (zram_test_flag(zram, index, ZRAM_IDLE))
 		zram_lru_del(zram, &zram->table[index]);
@@ -2563,9 +2810,7 @@ void zram_free_page(struct zram *zram, size_t index)
 	zram_clear_flag(zram, index, ZRAM_PAGE_FILE);
 	zram_set_priority(zram, index, 0);
 
-#ifdef CONFIG_ZRAM_WRITEBACK
-	zram_clear_prefetched(zram, index);
-#endif
+	was_allocated = zram_allocated(zram, index);
 
 	if (zram_test_flag(zram, index, ZRAM_HUGE)) {
 		zram_clear_flag(zram, index, ZRAM_HUGE);
@@ -2599,17 +2844,25 @@ void zram_free_page(struct zram *zram, size_t index)
 	}
 
 	handle = zram_get_handle(zram, index);
-	if (!handle)
+	if (!handle) {
+		zram_set_handle(zram, index, 0);
+		zram_set_obj_size(zram, index, 0);
+		/* UNDER_WB may remain for writeback owner */
+		WARN_ON_ONCE(zram->table[index].flags &
+			     ~((1UL << ZRAM_LOCK) | (1UL << ZRAM_UNDER_WB)));
 		return;
+	}
 
 	obj_size = zram_get_obj_size(zram, index);
 	zs_free(zram->mem_pool, handle);
 
 	atomic64_sub(obj_size, &zram->stats.compr_data_size);
 out:
-	atomic64_dec(&zram->stats.pages_stored);
+	if (was_allocated)
+		atomic64_dec(&zram->stats.pages_stored);
 	zram_set_handle(zram, index, 0);
 	zram_set_obj_size(zram, index, 0);
+	/* UNDER_WB may remain for writeback owner */
 	WARN_ON_ONCE(zram->table[index].flags &
 		     ~((1UL << ZRAM_LOCK) | (1UL << ZRAM_UNDER_WB)));
 }
@@ -2688,14 +2941,16 @@ static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 	unsigned long handle;
 	size_t size = 0;
 	u32 prio = 0;
+	int retries = 0;
 
 retry:
 	zram_slot_lock(zram, index);
 #ifdef CONFIG_ZRAM_WRITEBACK
 	if (zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
 		zram_slot_unlock(zram, index);
-		wait_on_bit(&zram->table[index].flags, ZRAM_UNDER_WB,
-			    TASK_UNINTERRUPTIBLE);
+		/* F: multi-shot bounded wait, never force-clear UNDER_WB */
+		if (zram_wait_under_wb_retry(zram, index))
+			return -EBUSY;
 		goto retry;
 	}
 #endif
@@ -2716,14 +2971,21 @@ retry:
 		zram_slot_unlock(zram, index);
 #ifdef CONFIG_ZRAM_WRITEBACK
 		ret = read_from_zms_sync(zram, page, handle, size, prio, index);
+		/*
+		 * Prefetch/free/writeback can race with the unlocked ZMS load.
+		 * Retry a few times instead of turning a transient race into
+		 * page loss.
+		 */
+		if (ret && retries++ < ZRAM_UNDER_WB_WAIT_RETRIES)
+			goto retry;
 #else
 		ret = -EIO;
 #endif
 	}
 
-	/* Should NEVER happen. Return bio error if it does. */
-	if (WARN_ON(ret < 0))
-		pr_err("Decompression failed! err=%d, page=%u\n", ret, index);
+	if (ret < 0)
+		pr_err_ratelimited("zram read failed err=%d page=%u\n", ret,
+				   index);
 
 	return ret;
 }
@@ -2841,10 +3103,19 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 #endif //CONFIG_ZRAM_MULTI_COMP
 
 	/* First, free memory allocated to this slot (if any) */
+retry_write:
 	zram_slot_lock(zram, index);
+#ifdef CONFIG_ZRAM_WRITEBACK
+	if (zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
+		zram_slot_unlock(zram, index);
+		/* F: multi-shot bounded wait, never force-clear UNDER_WB */
+		if (zram_wait_under_wb_retry(zram, index))
+			return -EBUSY;
+		goto retry_write;
+	}
+#endif
 	zram_free_page(zram, index);
 	zram_slot_unlock(zram, index);
-
 
 	mem = kmap_atomic(page);
 	same_filled = page_same_filled(mem, &element);
@@ -4527,28 +4798,26 @@ static unsigned long zram_shrinker_scan(struct shrinker *shrinker, struct shrink
 		shrink_ret = SHRINK_STOP;
 		goto out_unlock;
 	}
-	
+
 	/* 通过上下文传递pp control结构 */
 	ctx.ctl = ctl;
 
 	/* 第一阶段:扫描LRU并收集需要writeback的页面 */
 	shrink_ret = list_lru_shrink_walk(&zram->zram_list_lru, sc, zram_shrink_cb, &ctx);
 
-	/* 第二阶段:使用批量处理所有收集的页面 */
+	/* 第二阶段:按波提交 writeback（≤BATCH_MAX inflight），等 wave 完成 */
 	if (atomic_read(&ctl->num_pp_slots) > 0) {
-		unsigned long nr_initial = atomic_read(&ctl->num_pp_slots);
 		int writeback_result = zram_writeback_slots(zram, ctl);
-		
-		if (writeback_result) {
+
+		if (writeback_result < 0) {
+			/* hard failure with zero success */
 			atomic64_inc(&zram->stats.reject_reclaim_fail);
 		} else {
 			/*
-			 * zram_writeback_slots 内部通过 wait_for_completion 等待
-			 * 所有异步 bio 完成后才返回,此时 ctl->num_pp_slots 已被
-			 * complete_wb_request 递减为 0,因此需在调用前保存初始值。
+			 * C: report real commit successes from workers, not
+			 * the number of slots initially selected.
 			 */
-			pages_written = nr_initial;
-			atomic64_add(pages_written, &zram->stats.written_back_pages);
+			pages_written = writeback_result;
 		}
 	}
 
@@ -4628,6 +4897,14 @@ static int __init zram_init(void)
 				       0);
 	if (!zram_read_wq)
 		goto out_destroy_writeback;
+	zram_wb_wq = alloc_workqueue("zram-wb",
+				     WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_HIGHPRI,
+				     0);
+	if (!zram_wb_wq) {
+		destroy_workqueue(zram_read_wq);
+		zram_read_wq = NULL;
+		goto out_destroy_writeback;
+	}
 #endif
 
 	ret = zram_memcg_init();
@@ -4658,6 +4935,10 @@ out_memcg:
 
 out_destroy_writeback:
 #ifdef CONFIG_ZRAM_WRITEBACK
+	if (zram_wb_wq) {
+		destroy_workqueue(zram_wb_wq);
+		zram_wb_wq = NULL;
+	}
 	if (zram_read_wq) {
 		destroy_workqueue(zram_read_wq);
 		zram_read_wq = NULL;
@@ -4685,6 +4966,11 @@ static void __exit zram_exit(void)
 	zram_opt_exit();
 	zram_memcg_exit();
 #ifdef CONFIG_ZRAM_WRITEBACK
+	if (zram_wb_wq) {
+		flush_workqueue(zram_wb_wq);
+		destroy_workqueue(zram_wb_wq);
+		zram_wb_wq = NULL;
+	}
 	if (zram_read_wq) {
 		destroy_workqueue(zram_read_wq);
 		zram_read_wq = NULL;

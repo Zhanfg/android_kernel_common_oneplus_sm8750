@@ -15,6 +15,14 @@
 #define ZRAM_WB_BATCH_MAX		32U
 #define ZRAM_WB_GC_AFTER_WRITTEN	64U
 
+/*
+ * Waiters on ZRAM_UNDER_WB must not block forever: a stuck bit freezes
+ * fault/write paths and can hang the whole UI (touch/power/adb).
+ * Keep ownership (never force-clear); retry a few bounded waits instead.
+ */
+#define ZRAM_UNDER_WB_WAIT_TIMEOUT	(2 * HZ)
+#define ZRAM_UNDER_WB_WAIT_RETRIES	3
+
 #define ZRAM_ZMS_PREFETCH_MAX		2U
 #define ZRAM_PREFETCH_NEIGHBOR_SCAN_MAX	4U
 #define ZRAM_PREFETCH_TTL_MS		1000U

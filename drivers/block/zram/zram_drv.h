@@ -190,6 +190,7 @@ struct zram {
 	u32 prefetch_last_fault_index;
 	u32 prefetch_prev_fault_index;
 	bool prefetch_fault_valid;
+	atomic_t prefetch_inflight;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
