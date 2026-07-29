@@ -10,15 +10,23 @@ Branch: oneplus/sm8750_b_16.0.0_oneplus_13
 Tracking branch: upstream/oneplus-sm8750-b-16.0.0-oneplus-13
 ```
 
-2026-07-29 核对到的官方 tip：
+2026-07-29 核对到的官方发布：
 
 ```text
-Commit: e1b346b6b4f4096eb342ae3684838a942fd6f6c4
 Device release: PJZ110_16.0.9.401(CN01)
 Android common tag: android15-6.6-2026-01_r22
 ```
 
-该 SHA 只表示核对时的分支 tip。正式构建仍必须保存 `OnePlusOSS/kernel_manifest:oneplus/sm8750` 下 `oneplus_13_b.xml` 对应的固定 revision manifest。
+完整 OnePlusOSS 核心组件：
+
+| 组件 | 分支 | 核对提交 |
+|---|---|---|
+| common | `oneplus/sm8750_b_16.0.0_oneplus_13` | `e1b346b6b4f4096eb342ae3684838a942fd6f6c4` |
+| msm-kernel | `oneplus/sm8750_b_16.0.0_oneplus_13` | `6028f47faddaa27700f8dd3a1d83906ea8f27170` |
+| modules / devicetree | `oneplus/sm8750_b_16.0.0_oneplus_13` | `d50b305f7da9e14715a25120a4ac7b1a4b8b97c3` |
+| manifest | `oneplus/sm8750` / `oneplus_13_b.xml` | 正式构建以 `repo manifest -r` 固定结果为准 |
+
+这些 SHA 只表示核对时各官方分支的 tip。正式构建必须保存 `OnePlusOSS/kernel_manifest:oneplus/sm8750` 下 `oneplus_13_b.xml` 对应的固定 revision manifest。
 
 ## 2. 完整工程依赖
 
