@@ -1,0 +1,164 @@
+name: Test OnePlus 13 Upstream Resolution Pass 2
+
+on:
+  pull_request:
+    branches: ["6.6-final"]
+    paths:
+      - "sync/resolutions/16.0.9.401/pass2-ours.txt"
+      - "sync/resolutions/16.0.9.401/pass2-theirs.txt"
+      - ".github/workflows/test-upstream-resolution-pass2.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus13-test-upstream-resolution-pass2
+  cancel-in-progress: true
+
+env:
+  LOCAL_BRANCH: 6.6-final
+  OFFICIAL_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git
+  OFFICIAL_SHA: e1b346b6b4f4096eb342ae3684838a942fd6f6c4
+  EXPECTED_INITIAL_CONFLICTS: "116"
+  EXPECTED_AFTER_PASS1: "85"
+  EXPECTED_AFTER_PASS2: "67"
+
+jobs:
+  test-pass-2:
+    if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Fetch base, resolution inputs and official history
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git config gc.auto 0
+          git config advice.detachedHead false
+          git remote add local "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add official "${OFFICIAL_REPO}"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules local \
+            "+refs/heads/${LOCAL_BRANCH}:refs/remotes/local/${LOCAL_BRANCH}" \
+            "+${PR_HEAD_SHA}:refs/remotes/local/resolution-head"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules official \
+            "+${OFFICIAL_SHA}:refs/remotes/official/pinned"
+          git checkout --detach "refs/remotes/local/${LOCAL_BRANCH}"
+
+          for path in \
+            scripts/resolve_merge_markers.py \
+            sync/resolutions/16.0.9.401/pass1-ours.txt \
+            sync/resolutions/16.0.9.401/pass2-ours.txt \
+            sync/resolutions/16.0.9.401/pass2-theirs.txt; do
+            git show "refs/remotes/local/resolution-head:${path}" > "/tmp/$(basename "${path}")"
+          done
+          chmod +x /tmp/resolve_merge_markers.py
+
+      - name: Apply pass 1 and pass 2
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          count_conflicts() {
+            git diff --name-only --diff-filter=U | LC_ALL=C sort -u > "$1"
+            awk 'END {print NR + 0}' "$1"
+          }
+
+          stage_paths() {
+            local list="$1"
+            while IFS= read -r path; do
+              [ -n "${path}" ] || continue
+              git add -- "${path}"
+            done < "${list}"
+          }
+
+          verify_paths() {
+            local list="$1"
+            local remaining="$2"
+            while IFS= read -r path; do
+              [ -n "${path}" ] || continue
+              if grep -Fxq -- "${path}" "${remaining}"; then
+                echo "Resolved path remains unmerged: ${path}" >&2
+                exit 1
+              fi
+              if grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- "${path}"; then
+                echo "Conflict marker remains: ${path}" >&2
+                exit 1
+              fi
+            done < "${list}"
+          }
+
+          set +e
+          git merge --no-commit --no-ff "${OFFICIAL_SHA}"
+          MERGE_STATUS=$?
+          set -e
+          BEFORE="$(count_conflicts /tmp/conflicts-before.txt)"
+          if [ "${MERGE_STATUS}" -eq 0 ] || [ "${BEFORE}" != "${EXPECTED_INITIAL_CONFLICTS}" ]; then
+            echo "Initial conflict baseline mismatch: expected ${EXPECTED_INITIAL_CONFLICTS}, got ${BEFORE}." >&2
+            exit 1
+          fi
+
+          python3 /tmp/resolve_merge_markers.py --root . --paths-file /tmp/pass1-ours.txt --choice ours | tee /tmp/pass1.log
+          stage_paths /tmp/pass1-ours.txt
+          AFTER1="$(count_conflicts /tmp/conflicts-after-pass1.txt)"
+          verify_paths /tmp/pass1-ours.txt /tmp/conflicts-after-pass1.txt
+          if [ "${AFTER1}" != "${EXPECTED_AFTER_PASS1}" ]; then
+            echo "Pass-1 baseline mismatch: expected ${EXPECTED_AFTER_PASS1}, got ${AFTER1}." >&2
+            exit 1
+          fi
+
+          python3 /tmp/resolve_merge_markers.py --root . --paths-file /tmp/pass2-ours.txt --choice ours | tee /tmp/pass2-ours.log
+          python3 /tmp/resolve_merge_markers.py --root . --paths-file /tmp/pass2-theirs.txt --choice theirs | tee /tmp/pass2-theirs.log
+          stage_paths /tmp/pass2-ours.txt
+          stage_paths /tmp/pass2-theirs.txt
+
+          AFTER2="$(count_conflicts /tmp/conflicts-after-pass2.txt)"
+          verify_paths /tmp/pass2-ours.txt /tmp/conflicts-after-pass2.txt
+          verify_paths /tmp/pass2-theirs.txt /tmp/conflicts-after-pass2.txt
+          if [ "${AFTER2}" != "${EXPECTED_AFTER_PASS2}" ]; then
+            echo "Pass-2 result mismatch: expected ${EXPECTED_AFTER_PASS2}, got ${AFTER2}." >&2
+            exit 1
+          fi
+
+          : > /tmp/pass2-resolved-files.patch
+          cat /tmp/pass2-ours.txt /tmp/pass2-theirs.txt | while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            git diff --cached --binary HEAD -- "${path}" >> /tmp/pass2-resolved-files.patch
+          done
+
+          {
+            echo "# OnePlus 13 resolution pass 2"
+            echo
+            echo "- Initial conflicts: ${BEFORE}"
+            echo "- After pass 1: ${AFTER1}"
+            echo "- Pass-2 paths: $((AFTER1 - AFTER2))"
+            echo "- Remaining conflicts: ${AFTER2}"
+            echo "- Rule validation: passed"
+            echo "- Source integration: still blocked"
+          } > /tmp/pass2-report.md
+          cat /tmp/pass2-report.md >> "${GITHUB_STEP_SUMMARY}"
+          git merge --abort 2>/dev/null || true
+
+      - name: Upload pass-2 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13-common-resolution-pass2-${{ github.run_id }}
+          path: |
+            /tmp/pass2-report.md
+            /tmp/pass1.log
+            /tmp/pass2-ours.log
+            /tmp/pass2-theirs.log
+            /tmp/pass2-resolved-files.patch
+            /tmp/conflicts-after-pass2.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Confirm integration remains blocked
+        run: |
+          echo "Pass-2 rules are reproducible. The official source merge remains blocked by 67 unresolved paths."

@@ -1,0 +1,17 @@
+arch/loongarch/net/bpf_jit.c
+drivers/gpio/gpio-regmap.c
+drivers/hid/usbhid/hid-core.c
+drivers/hwmon/occ/common.c
+drivers/power/supply/cw2015_battery.c
+drivers/usb/gadget/legacy/raw_gadget.c
+fs/btrfs/tree-log.c
+fs/hfsplus/unicode.c
+fs/nfsd/nfs4proc.c
+include/sound/pcm.h
+init/Kconfig
+mm/migrate.c
+net/sched/sch_ets.c
+net/vmw_vsock/virtio_transport_common.c
+sound/core/oss/pcm_oss.c
+sound/core/pcm_native.c
+sound/usb/endpoint.c
