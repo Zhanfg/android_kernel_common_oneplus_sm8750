@@ -25,14 +25,22 @@ jobs:
   verify:
     if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout local common branch
+      - name: Checkout local common history without full worktree
         uses: actions/checkout@v4
         with:
           ref: ${{ env.LOCAL_BRANCH }}
           fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            README.md
+            UPSTREAM.md
+            Makefile
+          sparse-checkout-cone-mode: false
+          show-progress: false
 
       - name: Fetch and mirror official common
         id: verify
@@ -41,8 +49,9 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove upstream 2>/dev/null || true
           git remote add upstream "${UPSTREAM_REPO}"
-          git fetch --no-tags --prune upstream \
+          git fetch --filter=blob:none --no-tags --prune --no-recurse-submodules upstream \
             "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
 
           LOCAL_SHA="$(git rev-parse HEAD)"
@@ -73,7 +82,6 @@ jobs:
             echo
           } > "${REPORT}"
 
-          # Exact mirror of the official floating branch. Never place local work here.
           git push --force origin \
             "${UPSTREAM_REF}:refs/heads/${TRACKING_BRANCH}"
 
