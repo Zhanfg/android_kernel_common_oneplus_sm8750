@@ -1,0 +1,137 @@
+name: Verify OnePlus 13 Common Upstream on PR
+
+on:
+  pull_request:
+    branches: ["6.6-final"]
+    paths:
+      - "UPSTREAM.md"
+      - ".github/workflows/verify-upstream-pr.yml"
+      - ".github/workflows/sync-upstream.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: oneplus13-common-upstream-pr-check
+  cancel-in-progress: true
+
+env:
+  LOCAL_BRANCH: 6.6-final
+  UPSTREAM_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git
+  UPSTREAM_BRANCH: oneplus/sm8750_b_16.0.0_oneplus_13
+  TRACKING_BRANCH: upstream/oneplus-sm8750-b-16.0.0-oneplus-13
+
+jobs:
+  verify:
+    if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout local common branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.LOCAL_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch and mirror official common
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "${UPSTREAM_REPO}"
+          git fetch --no-tags --prune upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_REF="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_REF}")"
+          MERGE_BASE="$(git merge-base "${LOCAL_SHA}" "${UPSTREAM_SHA}" 2>/dev/null || true)"
+          REPORT="upstream-pr-check.md"
+
+          kernel_version() {
+            git show "$1:Makefile" 2>/dev/null | awk '
+              /^VERSION =/ {v=$3}
+              /^PATCHLEVEL =/ {p=$3}
+              /^SUBLEVEL =/ {s=$3; print v "." p "." s; exit}
+            '
+          }
+
+          {
+            echo "# OnePlus 13 common upstream PR check"
+            echo
+            echo "- Local branch: \`${LOCAL_BRANCH}\`"
+            echo "- Local SHA: \`${LOCAL_SHA}\`"
+            echo "- Local kernel: \`$(kernel_version "${LOCAL_SHA}" || echo unknown)\`"
+            echo "- Official branch: \`${UPSTREAM_BRANCH}\`"
+            echo "- Official SHA: \`${UPSTREAM_SHA}\`"
+            echo "- Official kernel: \`$(kernel_version "${UPSTREAM_SHA}" || echo unknown)\`"
+            echo "- Common ancestor: \`${MERGE_BASE:-none}\`"
+            echo "- Tracking branch: \`${TRACKING_BRANCH}\`"
+            echo
+          } > "${REPORT}"
+
+          # Exact mirror of the official floating branch. Never place local work here.
+          git push --force origin \
+            "${UPSTREAM_REF}:refs/heads/${TRACKING_BRANCH}"
+
+          if [ -z "${MERGE_BASE}" ]; then
+            {
+              echo "## Result"
+              echo
+              echo "The official tracking branch was updated. The custom and official branches have no common Git ancestor, so automatic integration is blocked."
+              echo
+              echo "Create a clean migration branch from the official tip and replay local feature groups with separate commits."
+            } >> "${REPORT}"
+            cat "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+            echo "result=no-common-history" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          set +e
+          git merge-tree --write-tree "${LOCAL_SHA}" "${UPSTREAM_SHA}" >/tmp/merge-tree.out 2>/tmp/merge-tree.err
+          STATUS=$?
+          set -e
+
+          if [ "${STATUS}" -ne 0 ]; then
+            {
+              echo "## Result"
+              echo
+              echo "A non-destructive merge-tree check found conflicts. No candidate branch was created."
+              echo
+              echo "## Merge-tree output"
+              echo
+              echo '```text'
+              sed -n '1,240p' /tmp/merge-tree.out
+              sed -n '1,120p' /tmp/merge-tree.err
+              echo '```'
+            } >> "${REPORT}"
+            cat "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+            echo "result=merge-conflict" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "## Result"
+            echo
+            echo "The non-destructive merge-tree check completed without textual conflicts. A separate Draft sync PR is still required before integration."
+          } >> "${REPORT}"
+          cat "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "result=clean-merge-tree" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload upstream check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13-common-upstream-pr-check-${{ github.run_id }}
+          path: upstream-pr-check.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Mark manual integration requirement
+        if: steps.verify.outputs.result != 'clean-merge-tree'
+        run: |
+          echo "Official upstream was mirrored, but automatic integration is not safe. See the report."
+          exit 1
