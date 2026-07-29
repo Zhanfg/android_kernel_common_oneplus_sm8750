@@ -1,0 +1,153 @@
+name: Test OnePlus 13 Upstream Resolution Pass
+
+on:
+  pull_request:
+    branches: ["6.6-final"]
+    paths:
+      - "sync/resolutions/16.0.9.401/**"
+      - "scripts/resolve_merge_markers.py"
+      - ".github/workflows/test-upstream-resolution-pass.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus13-test-upstream-resolution-pass
+  cancel-in-progress: true
+
+env:
+  LOCAL_BRANCH: 6.6-final
+  OFFICIAL_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git
+  OFFICIAL_SHA: e1b346b6b4f4096eb342ae3684838a942fd6f6c4
+  EXPECTED_INITIAL_CONFLICTS: "116"
+  EXPECTED_REMAINING_CONFLICTS: "85"
+
+jobs:
+  test-pass-1:
+    if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Fetch base, resolution inputs and official history
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git init .
+          git config gc.auto 0
+          git config advice.detachedHead false
+          git remote add local "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add official "${OFFICIAL_REPO}"
+
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules local \
+            "+refs/heads/${LOCAL_BRANCH}:refs/remotes/local/${LOCAL_BRANCH}" \
+            "+${PR_HEAD_SHA}:refs/remotes/local/resolution-head"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules official \
+            "+${OFFICIAL_SHA}:refs/remotes/official/pinned"
+
+          git checkout --detach "refs/remotes/local/${LOCAL_BRANCH}"
+          git show "refs/remotes/local/resolution-head:scripts/resolve_merge_markers.py" \
+            > /tmp/resolve_merge_markers.py
+          git show "refs/remotes/local/resolution-head:sync/resolutions/16.0.9.401/pass1-ours.txt" \
+            > /tmp/pass1-ours.txt
+          chmod +x /tmp/resolve_merge_markers.py
+
+      - name: Apply and verify pass 1
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          set +e
+          git merge --no-commit --no-ff "${OFFICIAL_SHA}"
+          MERGE_STATUS=$?
+          set -e
+
+          git diff --name-only --diff-filter=U | LC_ALL=C sort -u > /tmp/conflicts-before.txt
+          BEFORE="$(awk 'END {print NR + 0}' /tmp/conflicts-before.txt)"
+          if [ "${MERGE_STATUS}" -eq 0 ] || [ "${BEFORE}" -eq 0 ]; then
+            echo "Expected a conflicted merge, but no conflicts were produced." >&2
+            exit 1
+          fi
+          if [ "${BEFORE}" != "${EXPECTED_INITIAL_CONFLICTS}" ]; then
+            echo "Conflict baseline drifted: expected ${EXPECTED_INITIAL_CONFLICTS}, got ${BEFORE}." >&2
+            exit 1
+          fi
+
+          python3 /tmp/resolve_merge_markers.py \
+            --root . \
+            --paths-file /tmp/pass1-ours.txt \
+            --choice ours | tee /tmp/pass1-resolver.log
+
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            git add -- "${path}"
+          done < /tmp/pass1-ours.txt
+
+          git diff --name-only --diff-filter=U | LC_ALL=C sort -u > /tmp/conflicts-after.txt
+          AFTER="$(awk 'END {print NR + 0}' /tmp/conflicts-after.txt)"
+
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            if grep -Fxq -- "${path}" /tmp/conflicts-after.txt; then
+              echo "Pass-1 path remains unmerged: ${path}" >&2
+              exit 1
+            fi
+            if grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- "${path}"; then
+              echo "Pass-1 path still contains conflict markers: ${path}" >&2
+              exit 1
+            fi
+          done < /tmp/pass1-ours.txt
+
+          if [ "${AFTER}" != "${EXPECTED_REMAINING_CONFLICTS}" ]; then
+            echo "Unexpected pass-1 result: expected ${EXPECTED_REMAINING_CONFLICTS}, got ${AFTER}." >&2
+            exit 1
+          fi
+
+          : > /tmp/pass1-resolved-files.patch
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            git diff --cached --binary HEAD -- "${path}" >> /tmp/pass1-resolved-files.patch
+          done < /tmp/pass1-ours.txt
+
+          {
+            echo "# OnePlus 13 16.0.9.401 resolution pass 1"
+            echo
+            echo "- Local SHA: \`$(git rev-parse HEAD)\`"
+            echo "- Official SHA: \`${OFFICIAL_SHA}\`"
+            echo "- Initial conflict paths: ${BEFORE}"
+            echo "- Resolved paths: $((BEFORE - AFTER))"
+            echo "- Remaining conflict paths: ${AFTER}"
+            echo
+            echo "Pass 1 replaced only marked conflict blocks in 31 verified paths."
+            echo "Clean official hunks outside those blocks remain applied."
+          } > /tmp/pass1-report.md
+
+          cat /tmp/pass1-report.md >> "${GITHUB_STEP_SUMMARY}"
+          echo "remaining=${AFTER}" >> "${GITHUB_OUTPUT}"
+          git merge --abort 2>/dev/null || true
+
+      - name: Upload pass-1 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13-common-resolution-pass1-${{ github.run_id }}
+          path: |
+            /tmp/pass1-report.md
+            /tmp/pass1-resolver.log
+            /tmp/pass1-resolved-files.patch
+            /tmp/conflicts-before.txt
+            /tmp/conflicts-after.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Keep integration blocked while conflicts remain
+        if: steps.resolve.outputs.remaining != '0'
+        run: |
+          echo "Pass 1 is reproducible, but unresolved conflicts remain. No merge branch was pushed."
+          exit 1
