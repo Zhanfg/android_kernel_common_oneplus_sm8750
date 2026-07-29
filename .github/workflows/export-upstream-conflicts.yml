@@ -24,16 +24,26 @@ jobs:
   export:
     if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout custom common
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.LOCAL_BRANCH }}
-          fetch-depth: 0
-          filter: blob:none
-          show-progress: false
+      - name: Fetch only the two required histories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git init .
+          git config gc.auto 0
+          git config advice.detachedHead false
+          git remote add local "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add official "${OFFICIAL_REPO}"
+
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules local \
+            "+refs/heads/${LOCAL_BRANCH}:refs/remotes/local/${LOCAL_BRANCH}"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules official \
+            "+${OFFICIAL_SHA}:refs/remotes/official/pinned"
+
+          git checkout --detach "refs/remotes/local/${LOCAL_BRANCH}"
 
       - name: Merge official tip and export conflict stages
         id: export
@@ -43,10 +53,6 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote remove official 2>/dev/null || true
-          git remote add official "${OFFICIAL_REPO}"
-          git fetch --filter=blob:none --no-tags --no-recurse-submodules official \
-            "+${OFFICIAL_SHA}:refs/remotes/official/pinned"
 
           LOCAL_SHA="$(git rev-parse HEAD)"
           MERGE_BASE="$(git merge-base "${LOCAL_SHA}" "${OFFICIAL_SHA}")"
@@ -129,7 +135,6 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
           echo "conflict_count=${CONFLICT_COUNT}" >> "${GITHUB_OUTPUT}"
-
           git merge --abort 2>/dev/null || true
 
       - name: Upload conflict bundle
