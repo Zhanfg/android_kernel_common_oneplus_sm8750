@@ -1,0 +1,6 @@
+{
+  "arch/x86/kernel/cpu/microcode/amd.c": [
+    "ours",
+    "theirs"
+  ]
+}
