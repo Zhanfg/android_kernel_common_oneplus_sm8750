@@ -1,0 +1,6 @@
+.gitignore
+arch/mips/mm/tlb-r4k.c
+kernel/events/callchain.c
+kernel/events/core.c
+net/mptcp/protocol.c
+net/sched/sch_cake.c
