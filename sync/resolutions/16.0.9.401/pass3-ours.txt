@@ -1,0 +1,13 @@
+arch/arm64/net/bpf_jit_comp.c
+arch/x86/mm/kaslr.c
+drivers/bluetooth/btusb.c
+drivers/cpuidle/governors/menu.c
+drivers/net/wireless/realtek/rtw88/sdio.c
+drivers/spi/spi-tegra210-quad.c
+drivers/usb/typec/tcpm/tcpm.c
+fs/ntfs3/run.c
+net/ipv4/esp4_offload.c
+net/ipv6/esp6_offload.c
+net/openvswitch/flow_netlink.c
+net/sched/act_ife.c
+sound/pci/hda/patch_realtek.c
