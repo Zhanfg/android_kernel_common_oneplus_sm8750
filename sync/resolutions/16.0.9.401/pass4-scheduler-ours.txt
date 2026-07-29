@@ -1,0 +1,10 @@
+arch/arm64/configs/gki_defconfig
+include/asm-generic/vmlinux.lds.h
+include/linux/sched.h
+include/linux/sched/task.h
+include/uapi/linux/sched.h
+kernel/Kconfig.preempt
+kernel/sched/core.c
+kernel/sched/debug.c
+kernel/sched/idle.c
+kernel/time/tick-sched.c

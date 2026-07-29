@@ -1,0 +1,3 @@
+include/trace/hooks/dtask.h
+include/trace/hooks/sched.h
+kernel/sched/vendor_hooks.c

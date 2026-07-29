@@ -1,0 +1,207 @@
+name: Test OnePlus 13 Scheduler Resolution Pass 4
+
+on:
+  pull_request:
+    branches: ["6.6-final"]
+    paths:
+      - "sync/resolutions/16.0.9.401/pass4-scheduler-*"
+      - "scripts/resolve_merge_plan.py"
+      - ".github/workflows/test-upstream-resolution-pass4-scheduler.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus13-test-upstream-resolution-pass4-scheduler
+  cancel-in-progress: true
+
+env:
+  LOCAL_BRANCH: 6.6-final
+  OFFICIAL_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git
+  OFFICIAL_SHA: e1b346b6b4f4096eb342ae3684838a942fd6f6c4
+  EXPECTED_INITIAL_CONFLICTS: "116"
+  EXPECTED_AFTER_PASS1: "85"
+  EXPECTED_AFTER_PASS2: "67"
+  EXPECTED_AFTER_PASS3: "50"
+  EXPECTED_AFTER_PASS4: "33"
+
+jobs:
+  test-pass-4-scheduler:
+    if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Fetch base, resolution inputs and official history
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git config gc.auto 0
+          git config advice.detachedHead false
+          git remote add local "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add official "${OFFICIAL_REPO}"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules local \
+            "+refs/heads/${LOCAL_BRANCH}:refs/remotes/local/${LOCAL_BRANCH}" \
+            "+${PR_HEAD_SHA}:refs/remotes/local/resolution-head"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules official \
+            "+${OFFICIAL_SHA}:refs/remotes/official/pinned"
+          git checkout --detach "refs/remotes/local/${LOCAL_BRANCH}"
+
+          for path in \
+            scripts/resolve_merge_markers.py \
+            scripts/resolve_merge_plan.py \
+            sync/resolutions/16.0.9.401/pass1-ours.txt \
+            sync/resolutions/16.0.9.401/pass2-ours.txt \
+            sync/resolutions/16.0.9.401/pass2-theirs.txt \
+            sync/resolutions/16.0.9.401/pass3-ours.txt \
+            sync/resolutions/16.0.9.401/pass3-theirs.txt \
+            sync/resolutions/16.0.9.401/pass4-scheduler-ours.txt \
+            sync/resolutions/16.0.9.401/pass4-scheduler-theirs.txt \
+            sync/resolutions/16.0.9.401/pass4-scheduler-plan.json; do
+            git show "refs/remotes/local/resolution-head:${path}" > "/tmp/$(basename "${path}")"
+          done
+          chmod +x /tmp/resolve_merge_markers.py /tmp/resolve_merge_plan.py
+          python3 -m py_compile /tmp/resolve_merge_markers.py /tmp/resolve_merge_plan.py
+
+      - name: Apply and verify passes 1-4
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          count_conflicts() {
+            git diff --name-only --diff-filter=U | LC_ALL=C sort -u > "$1"
+            awk 'END {print NR + 0}' "$1"
+          }
+
+          stage_paths() {
+            while IFS= read -r path; do
+              [ -n "${path}" ] || continue
+              git add -- "${path}"
+            done < "$1"
+          }
+
+          verify_paths() {
+            local list="$1"
+            local remaining="$2"
+            while IFS= read -r path; do
+              [ -n "${path}" ] || continue
+              if grep -Fxq -- "${path}" "${remaining}"; then
+                echo "Resolved path remains unmerged: ${path}" >&2
+                exit 1
+              fi
+              if grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- "${path}"; then
+                echo "Conflict marker remains: ${path}" >&2
+                exit 1
+              fi
+            done < "${list}"
+          }
+
+          apply_markers() {
+            local list="$1"
+            local choice="$2"
+            local log="$3"
+            python3 /tmp/resolve_merge_markers.py --root . --paths-file "${list}" --choice "${choice}" | tee "${log}"
+            stage_paths "${list}"
+          }
+
+          set +e
+          git merge --no-commit --no-ff "${OFFICIAL_SHA}"
+          MERGE_STATUS=$?
+          set -e
+          BEFORE="$(count_conflicts /tmp/conflicts-before.txt)"
+          if [ "${MERGE_STATUS}" -eq 0 ] || [ "${BEFORE}" != "${EXPECTED_INITIAL_CONFLICTS}" ]; then
+            echo "Initial conflict baseline mismatch: expected ${EXPECTED_INITIAL_CONFLICTS}, got ${BEFORE}." >&2
+            exit 1
+          fi
+
+          apply_markers /tmp/pass1-ours.txt ours /tmp/pass1.log
+          AFTER1="$(count_conflicts /tmp/conflicts-after-pass1.txt)"
+          verify_paths /tmp/pass1-ours.txt /tmp/conflicts-after-pass1.txt
+          [ "${AFTER1}" = "${EXPECTED_AFTER_PASS1}" ] || { echo "Expected ${EXPECTED_AFTER_PASS1} after pass 1, got ${AFTER1}." >&2; exit 1; }
+
+          apply_markers /tmp/pass2-ours.txt ours /tmp/pass2-ours.log
+          apply_markers /tmp/pass2-theirs.txt theirs /tmp/pass2-theirs.log
+          AFTER2="$(count_conflicts /tmp/conflicts-after-pass2.txt)"
+          verify_paths /tmp/pass2-ours.txt /tmp/conflicts-after-pass2.txt
+          verify_paths /tmp/pass2-theirs.txt /tmp/conflicts-after-pass2.txt
+          [ "${AFTER2}" = "${EXPECTED_AFTER_PASS2}" ] || { echo "Expected ${EXPECTED_AFTER_PASS2} after pass 2, got ${AFTER2}." >&2; exit 1; }
+
+          apply_markers /tmp/pass3-ours.txt ours /tmp/pass3-ours.log
+          apply_markers /tmp/pass3-theirs.txt theirs /tmp/pass3-theirs.log
+          AFTER3="$(count_conflicts /tmp/conflicts-after-pass3.txt)"
+          verify_paths /tmp/pass3-ours.txt /tmp/conflicts-after-pass3.txt
+          verify_paths /tmp/pass3-theirs.txt /tmp/conflicts-after-pass3.txt
+          [ "${AFTER3}" = "${EXPECTED_AFTER_PASS3}" ] || { echo "Expected ${EXPECTED_AFTER_PASS3} after pass 3, got ${AFTER3}." >&2; exit 1; }
+
+          apply_markers /tmp/pass4-scheduler-ours.txt ours /tmp/pass4-ours.log
+          apply_markers /tmp/pass4-scheduler-theirs.txt theirs /tmp/pass4-theirs.log
+          python3 /tmp/resolve_merge_plan.py --root . --plan /tmp/pass4-scheduler-plan.json | tee /tmp/pass4-plan.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          for path in json.loads(Path('/tmp/pass4-scheduler-plan.json').read_text()):
+              print(path)
+          PY
+          python3 - <<'PY' > /tmp/pass4-plan-paths.txt
+          import json
+          from pathlib import Path
+          for path in json.loads(Path('/tmp/pass4-scheduler-plan.json').read_text()):
+              print(path)
+          PY
+          stage_paths /tmp/pass4-plan-paths.txt
+
+          AFTER4="$(count_conflicts /tmp/conflicts-after-pass4.txt)"
+          verify_paths /tmp/pass4-scheduler-ours.txt /tmp/conflicts-after-pass4.txt
+          verify_paths /tmp/pass4-scheduler-theirs.txt /tmp/conflicts-after-pass4.txt
+          verify_paths /tmp/pass4-plan-paths.txt /tmp/conflicts-after-pass4.txt
+          [ "${AFTER4}" = "${EXPECTED_AFTER_PASS4}" ] || { echo "Expected ${EXPECTED_AFTER_PASS4} after pass 4, got ${AFTER4}." >&2; exit 1; }
+
+          grep -qx 'CONFIG_HMBIRD_SCHED=y' arch/arm64/configs/gki_defconfig
+          ! grep -qx 'CONFIG_SCHED_CLASS_EXT=y' arch/arm64/configs/gki_defconfig
+          ! grep -qx 'CONFIG_SLIM_SCHED=y' arch/arm64/configs/gki_defconfig
+          grep -q '^#define SCHED_HMBIRD[[:space:]]*7$' include/uapi/linux/sched.h
+          ! grep -q '^#define SCHED_EXT[[:space:]]*7$' include/uapi/linux/sched.h
+          grep -q 'trace_android_vh_put_task(tsk);' kernel/fork.c
+          grep -q 'EXPORT_TRACEPOINT_SYMBOL_GPL(android_rvh_task_fits_cpu);' kernel/sched/vendor_hooks.c
+          grep -q 'EXPORT_SYMBOL_GPL(sysctl_sched_base_slice);' kernel/sched/fair.c
+          grep -q 'min(cost, sysctl_sched_migration_cost + 200)' kernel/sched/fair.c
+          grep -q 'sched_weight_from_cgroup' kernel/sched/sched.h
+
+          {
+            echo "# OnePlus 13 scheduler resolution pass 4"
+            echo
+            echo "- Initial conflicts: ${BEFORE}"
+            echo "- After pass 1: ${AFTER1}"
+            echo "- After pass 2: ${AFTER2}"
+            echo "- After pass 3: ${AFTER3}"
+            echo "- Scheduler paths resolved: $((AFTER3 - AFTER4))"
+            echo "- Remaining conflicts: ${AFTER4}"
+            echo "- Architecture: fair/wait + HMBIRD; official SCX/SLIM disabled"
+            echo "- Rule validation: passed"
+            echo "- Source integration: still blocked"
+          } > /tmp/pass4-report.md
+          cat /tmp/pass4-report.md >> "${GITHUB_STEP_SUMMARY}"
+          git merge --abort 2>/dev/null || true
+
+      - name: Upload scheduler pass evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13-common-resolution-pass4-scheduler-${{ github.run_id }}
+          path: |
+            /tmp/pass4-report.md
+            /tmp/pass4-ours.log
+            /tmp/pass4-theirs.log
+            /tmp/pass4-plan.log
+            /tmp/conflicts-after-pass4.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Confirm integration remains blocked
+        run: |
+          echo "Scheduler pass rules are reproducible. The source merge remains blocked by 33 unresolved paths."
