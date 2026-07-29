@@ -1,0 +1,233 @@
+name: Test OnePlus 13 Compatibility Resolution Pass 5
+
+on:
+  pull_request:
+    branches: ["6.6-final"]
+    paths:
+      - "sync/resolutions/16.0.9.401/pass5-compat-*"
+      - ".github/workflows/test-upstream-resolution-pass5-compat.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus13-test-upstream-resolution-pass5-compat
+  cancel-in-progress: true
+
+env:
+  LOCAL_BRANCH: 6.6-final
+  OFFICIAL_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git
+  OFFICIAL_SHA: e1b346b6b4f4096eb342ae3684838a942fd6f6c4
+  EXPECTED_INITIAL_CONFLICTS: "116"
+  EXPECTED_AFTER_PASS1: "85"
+  EXPECTED_AFTER_PASS2: "67"
+  EXPECTED_AFTER_PASS3: "50"
+  EXPECTED_AFTER_PASS4: "33"
+  EXPECTED_AFTER_PASS5: "23"
+
+jobs:
+  test-pass-5-compat:
+    if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Fetch base, resolution inputs and official history
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git config gc.auto 0
+          git config advice.detachedHead false
+          git remote add local "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add official "${OFFICIAL_REPO}"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules local \
+            "+refs/heads/${LOCAL_BRANCH}:refs/remotes/local/${LOCAL_BRANCH}" \
+            "+${PR_HEAD_SHA}:refs/remotes/local/resolution-head"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules official \
+            "+${OFFICIAL_SHA}:refs/remotes/official/pinned"
+          git checkout --detach "refs/remotes/local/${LOCAL_BRANCH}"
+
+          for path in \
+            scripts/resolve_merge_markers.py \
+            scripts/resolve_merge_plan.py \
+            sync/resolutions/16.0.9.401/pass1-ours.txt \
+            sync/resolutions/16.0.9.401/pass2-ours.txt \
+            sync/resolutions/16.0.9.401/pass2-theirs.txt \
+            sync/resolutions/16.0.9.401/pass3-ours.txt \
+            sync/resolutions/16.0.9.401/pass3-theirs.txt \
+            sync/resolutions/16.0.9.401/pass4-scheduler-ours.txt \
+            sync/resolutions/16.0.9.401/pass4-scheduler-theirs.txt \
+            sync/resolutions/16.0.9.401/pass4-scheduler-plan.json \
+            sync/resolutions/16.0.9.401/pass5-compat-ours.txt \
+            sync/resolutions/16.0.9.401/pass5-compat-theirs.txt \
+            sync/resolutions/16.0.9.401/pass5-compat-plan.json; do
+            git show "refs/remotes/local/resolution-head:${path}" > "/tmp/$(basename "${path}")"
+          done
+          chmod +x /tmp/resolve_merge_markers.py /tmp/resolve_merge_plan.py
+          python3 -m py_compile /tmp/resolve_merge_markers.py /tmp/resolve_merge_plan.py
+
+      - name: Apply and verify passes 1-5
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          count_conflicts() {
+            git diff --name-only --diff-filter=U | LC_ALL=C sort -u > "$1"
+            awk 'END {print NR + 0}' "$1"
+          }
+
+          stage_paths() {
+            while IFS= read -r path; do
+              [ -n "${path}" ] || continue
+              git add -- "${path}"
+            done < "$1"
+          }
+
+          verify_paths() {
+            local list="$1"
+            local remaining="$2"
+            while IFS= read -r path; do
+              [ -n "${path}" ] || continue
+              if grep -Fxq -- "${path}" "${remaining}"; then
+                echo "Resolved path remains unmerged: ${path}" >&2
+                exit 1
+              fi
+              if grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- "${path}"; then
+                echo "Conflict marker remains: ${path}" >&2
+                exit 1
+              fi
+            done < "${list}"
+          }
+
+          apply_markers() {
+            local list="$1"
+            local choice="$2"
+            local log="$3"
+            python3 /tmp/resolve_merge_markers.py --root . --paths-file "${list}" --choice "${choice}" | tee "${log}"
+            stage_paths "${list}"
+          }
+
+          apply_plan() {
+            local plan="$1"
+            local log="$2"
+            local paths="$3"
+            python3 /tmp/resolve_merge_plan.py --root . --plan "${plan}" | tee "${log}"
+            python3 - "${plan}" > "${paths}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          for path in json.loads(Path(sys.argv[1]).read_text()):
+              print(path)
+          PY
+            stage_paths "${paths}"
+          }
+
+          expect_count() {
+            local actual="$1"
+            local expected="$2"
+            local pass="$3"
+            if [ "${actual}" != "${expected}" ]; then
+              echo "Expected ${expected} conflicts after ${pass}, got ${actual}." >&2
+              exit 1
+            fi
+          }
+
+          set +e
+          git merge --no-commit --no-ff "${OFFICIAL_SHA}"
+          MERGE_STATUS=$?
+          set -e
+          BEFORE="$(count_conflicts /tmp/conflicts-before.txt)"
+          if [ "${MERGE_STATUS}" -eq 0 ]; then
+            echo "Expected a conflicted merge." >&2
+            exit 1
+          fi
+          expect_count "${BEFORE}" "${EXPECTED_INITIAL_CONFLICTS}" "initial merge"
+
+          apply_markers /tmp/pass1-ours.txt ours /tmp/pass1.log
+          AFTER1="$(count_conflicts /tmp/conflicts-after-pass1.txt)"
+          verify_paths /tmp/pass1-ours.txt /tmp/conflicts-after-pass1.txt
+          expect_count "${AFTER1}" "${EXPECTED_AFTER_PASS1}" "pass 1"
+
+          apply_markers /tmp/pass2-ours.txt ours /tmp/pass2-ours.log
+          apply_markers /tmp/pass2-theirs.txt theirs /tmp/pass2-theirs.log
+          AFTER2="$(count_conflicts /tmp/conflicts-after-pass2.txt)"
+          verify_paths /tmp/pass2-ours.txt /tmp/conflicts-after-pass2.txt
+          verify_paths /tmp/pass2-theirs.txt /tmp/conflicts-after-pass2.txt
+          expect_count "${AFTER2}" "${EXPECTED_AFTER_PASS2}" "pass 2"
+
+          apply_markers /tmp/pass3-ours.txt ours /tmp/pass3-ours.log
+          apply_markers /tmp/pass3-theirs.txt theirs /tmp/pass3-theirs.log
+          AFTER3="$(count_conflicts /tmp/conflicts-after-pass3.txt)"
+          verify_paths /tmp/pass3-ours.txt /tmp/conflicts-after-pass3.txt
+          verify_paths /tmp/pass3-theirs.txt /tmp/conflicts-after-pass3.txt
+          expect_count "${AFTER3}" "${EXPECTED_AFTER_PASS3}" "pass 3"
+
+          apply_markers /tmp/pass4-scheduler-ours.txt ours /tmp/pass4-ours.log
+          apply_markers /tmp/pass4-scheduler-theirs.txt theirs /tmp/pass4-theirs.log
+          apply_plan /tmp/pass4-scheduler-plan.json /tmp/pass4-plan.log /tmp/pass4-plan-paths.txt
+          AFTER4="$(count_conflicts /tmp/conflicts-after-pass4.txt)"
+          verify_paths /tmp/pass4-scheduler-ours.txt /tmp/conflicts-after-pass4.txt
+          verify_paths /tmp/pass4-scheduler-theirs.txt /tmp/conflicts-after-pass4.txt
+          verify_paths /tmp/pass4-plan-paths.txt /tmp/conflicts-after-pass4.txt
+          expect_count "${AFTER4}" "${EXPECTED_AFTER_PASS4}" "pass 4"
+
+          apply_markers /tmp/pass5-compat-ours.txt ours /tmp/pass5-ours.log
+          apply_markers /tmp/pass5-compat-theirs.txt theirs /tmp/pass5-theirs.log
+          apply_plan /tmp/pass5-compat-plan.json /tmp/pass5-plan.log /tmp/pass5-plan-paths.txt
+          AFTER5="$(count_conflicts /tmp/conflicts-after-pass5.txt)"
+          verify_paths /tmp/pass5-compat-ours.txt /tmp/conflicts-after-pass5.txt
+          verify_paths /tmp/pass5-compat-theirs.txt /tmp/conflicts-after-pass5.txt
+          verify_paths /tmp/pass5-plan-paths.txt /tmp/conflicts-after-pass5.txt
+          expect_count "${AFTER5}" "${EXPECTED_AFTER_PASS5}" "pass 5"
+
+          grep -q '^\*\.orig$' .gitignore
+          grep -q 'r4k_tlb_uniquify' arch/mips/mm/tlb-r4k.c
+          grep -q 'get_cutoff_revision' arch/x86/kernel/cpu/microcode/amd.c
+          grep -q '(0x60 <= model && model <= 0x6f)' arch/x86/kernel/cpu/microcode/amd.c
+          grep -q 'rcar_canfd_set_mode(gpriv);' drivers/net/can/rcar/rcar_canfd.c
+          grep -q 'channel->rstc = devm_reset_control_array_get_shared' drivers/phy/renesas/phy-rcar-gen3-usb2.c
+          grep -q 'reset_control_assert(channel->rstc);' drivers/phy/renesas/phy-rcar-gen3-usb2.c
+          grep -q 'is_user_task(current)' kernel/events/callchain.c
+          grep -q 'is_user_task(current)' kernel/events/core.c
+          grep -q '!msk->allow_subflows' net/mptcp/protocol.c
+          grep -q 'subflow_simultaneous_connect(sk)' net/mptcp/subflow.c
+          grep -q 'qdisc_tree_reduce_backlog' net/sched/sch_cake.c
+
+          {
+            echo "# OnePlus 13 compatibility resolution pass 5"
+            echo
+            echo "- Initial conflicts: ${BEFORE}"
+            echo "- After pass 1: ${AFTER1}"
+            echo "- After pass 2: ${AFTER2}"
+            echo "- After pass 3: ${AFTER3}"
+            echo "- After pass 4: ${AFTER4}"
+            echo "- Compatibility paths resolved: $((AFTER4 - AFTER5))"
+            echo "- Remaining conflicts: ${AFTER5}"
+            echo "- Rule validation: passed"
+            echo "- Source integration: still blocked"
+          } > /tmp/pass5-report.md
+          cat /tmp/pass5-report.md >> "${GITHUB_STEP_SUMMARY}"
+          git merge --abort 2>/dev/null || true
+
+      - name: Upload compatibility pass evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13-common-resolution-pass5-compat-${{ github.run_id }}
+          path: |
+            /tmp/pass5-report.md
+            /tmp/pass5-ours.log
+            /tmp/pass5-theirs.log
+            /tmp/pass5-plan.log
+            /tmp/conflicts-after-pass5.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Confirm integration remains blocked
+        run: |
+          echo "Compatibility pass rules are reproducible. The source merge remains blocked by 23 unresolved paths."
