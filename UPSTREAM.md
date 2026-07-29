@@ -1,6 +1,7 @@
 # SM8750 Common Upstream Policy
 
 更新时间：2026-07-29
+自动核验请求：2026-07-29
 
 ## 1. 主要官方上游
 
@@ -52,6 +53,8 @@ Android common tag: android15-6.6-2026-01_r22
 7. 无共同祖先或出现冲突时停止，不创建误导性候选。
 8. 上传 Markdown 报告并写入 Actions Summary。
 9. 永不直接修改或自动合并 `6.6-final`。
+
+`.github/workflows/verify-upstream-pr.yml` 用于同仓库 PR 核验，会更新同一官方跟踪分支，并执行非破坏性的共同祖先与 `merge-tree` 检查。
 
 跟踪分支的强制更新是预期行为，因为它只镜像官方浮动分支；本地开发提交不得放入该分支。
 
