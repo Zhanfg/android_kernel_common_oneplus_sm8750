@@ -1,156 +1,134 @@
-# How do I submit patches to Android Common Kernels
+# OnePlus 13 SM8750 Custom Common Kernel
 
-1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.
-   These patches will be merged automatically in the corresponding common kernels. If the patch is already
-   in upstream Linux, post a backport of the patch that conforms to the patch requirements below.
-   - Do not send patches upstream that contain only symbol exports. To be considered for upstream Linux,
-additions of `EXPORT_SYMBOL_GPL()` require an in-tree modular driver that uses the symbol -- so include
-the new driver or changes to an existing driver in the same patchset as the export.
-   - When sending patches upstream, the commit message must contain a clear case for why the patch
-is needed and beneficial to the community. Enabling out-of-tree drivers or functionality is not
-a persuasive case.
+这是 **OnePlus 13（PJZ110 / `sun` / SM8750）** 自定义内核项目的 common 源码仓库，默认开发分支为 `6.6-final`。
 
-2. LESS GOOD: Develop your patches out-of-tree (from an upstream Linux point-of-view). Unless these are
-   fixing an Android-specific bug, these are very unlikely to be accepted unless they have been
-   coordinated with kernel-team@android.com. If you want to proceed, post a patch that conforms to the
-   patch requirements below.
+> 本仓库只对应完整 OnePlus OKI 工程中的 `kernel_platform/common`。它不包含完整 msm-kernel、vendor modules、设备树、Kleaf/Bazel 依赖和工具链，因此不能单独代表完整 OnePlus 13 内核工程，也不应独立生成正式刷写包。
 
-# Common Kernel patch requirements
+## 项目关系
 
-- All patches must conform to the Linux kernel coding standards and pass `scripts/checkpatch.pl`
-- Patches shall not break gki_defconfig or allmodconfig builds for arm, arm64, x86, x86_64 architectures
-(see  https://source.android.com/setup/build/building-kernels)
-- If the patch is not merged from an upstream branch, the subject must be tagged with the type of patch:
-`UPSTREAM:`, `BACKPORT:`, `FROMGIT:`, `FROMLIST:`, or `ANDROID:`.
-- All patches must have a `Change-Id:` tag (see https://gerrit-review.googlesource.com/Documentation/user-changeid.html)
-- If an Android bug has been assigned, there must be a `Bug:` tag.
-- All patches must have a `Signed-off-by:` tag by the author and the submitter
+| 角色 | 仓库 / 分支 | 说明 |
+|---|---|---|
+| 项目控制仓库 | [`Zhanfg/OnePlus13-kernel`](https://github.com/Zhanfg/OnePlus13-kernel) / `main` | 构建、补丁、AK3、测试、发布与文档 |
+| 本仓库 | `Zhanfg/android_kernel_common_oneplus_sm8750` / `6.6-final` | common 层自定义补丁和开发历史 |
+| 官方 manifest | [`OnePlusOSS/kernel_manifest`](https://github.com/OnePlusOSS/kernel_manifest) / `oneplus/sm8750` | 完整 OKI 工程入口，使用 `oneplus_13_b.xml` |
+| 官方 common | [`OnePlusOSS/android_kernel_common_oneplus_sm8750`](https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750) / `oneplus/sm8750_b_16.0.0_oneplus_13` | 本仓库的主要官方上游 |
 
-Additional requirements are listed below based on patch type
+完整工程还需要：
 
-## Requirements for backports from mainline Linux: `UPSTREAM:`, `BACKPORT:`
+- `OnePlusOSS/android_kernel_oneplus_sm8750`
+- `OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750`
+- manifest 固定的 CodeLinaro / Kleaf / Bazel / 工具链依赖
 
-- If the patch is a cherry-pick from Linux mainline with no changes at all
-    - tag the patch subject with `UPSTREAM:`.
-    - add upstream commit information with a `(cherry picked from commit ...)` line
-    - Example:
-        - if the upstream commit message is
-```
-        important patch from upstream
+## 当前官方基线
 
-        This is the detailed description of the important patch
+最后核对：**2026-07-29**。
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
->- then Joe Smith would upload the patch for the common kernel as
-```
-        UPSTREAM: important patch from upstream
+| 项目 | 当前值 |
+|---|---|
+| 设备系统 | `PJZ110_16.0.9.401(CN01)` |
+| Manifest | `OnePlusOSS/kernel_manifest:oneplus/sm8750` |
+| Manifest 文件 | `oneplus_13_b.xml` |
+| 官方 common 分支 | `oneplus/sm8750_b_16.0.0_oneplus_13` |
+| 官方 common 提交 | `e1b346b6b4f4096eb342ae3684838a942fd6f6c4` |
+| Android common tag | `android15-6.6-2026-01_r22` |
+| 内核系列 | Android 15 / Linux 6.6 |
+| 本地开发分支 | `6.6-final` |
 
-        This is the detailed description of the important patch
+上游提交会同步到只读跟踪分支：
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry picked from commit c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+```text
+upstream/oneplus-sm8750-b-16.0.0-oneplus-13
 ```
 
-- If the patch requires any changes from the upstream version, tag the patch with `BACKPORT:`
-instead of `UPSTREAM:`.
-    - use the same tags as `UPSTREAM:`
-    - add comments about the changes under the `(cherry picked from commit ...)` line
-    - Example:
-```
-        BACKPORT: important patch from upstream
+跟踪分支只镜像官方 common，不包含本项目自定义补丁。
 
-        This is the detailed description of the important patch
+## 当前状态
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+- `6.6-final` 包含本项目的 common 层自定义改动。
+- 当前分支最新本地提交包含 BORE 生命周期修复等本地补丁。
+- 官方 16.0.9.401 common 上游已经确认，但尚未宣称完整合入 `6.6-final`。
+- 自动同步只负责更新官方跟踪分支，并在能够安全合并时创建 Draft PR。
+- 无共同祖先或出现冲突时，工作流会停止并上传报告，不会覆盖 `6.6-final`。
+- 真机启动和运行时验证仍由完整 OKI 工程完成。
 
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry picked from commit c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        [joe: Resolved minor conflict in drivers/foo/bar.c ]
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+## 上游同步
 
-## Requirements for other backports: `FROMGIT:`, `FROMLIST:`,
+工作流：
 
-- If the patch has been merged into an upstream maintainer tree, but has not yet
-been merged into Linux mainline
-    - tag the patch subject with `FROMGIT:`
-    - add info on where the patch came from as `(cherry picked from commit <sha1> <repo> <branch>)`. This
-must be a stable maintainer branch (not rebased, so don't use `linux-next` for example).
-    - if changes were required, use `BACKPORT: FROMGIT:`
-    - Example:
-        - if the commit message in the maintainer tree is
-```
-        important patch from upstream
-
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
->- then Joe Smith would upload the patch for the common kernel as
-```
-        FROMGIT: important patch from upstream
-
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-
-        Bug: 135791357
-        (cherry picked from commit 878a2fd9de10b03d11d2f622250285c7e63deace
-         https://git.kernel.org/pub/scm/linux/kernel/git/foo/bar.git test-branch)
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+```text
+.github/workflows/sync-upstream.yml
 ```
 
+行为：
 
-- If the patch has been submitted to LKML, but not accepted into any maintainer tree
-    - tag the patch subject with `FROMLIST:`
-    - add a `Link:` tag with a link to the submittal on lore.kernel.org
-    - add a `Bug:` tag with the Android bug (required for patches not accepted into
-a maintainer tree)
-    - if changes were required, use `BACKPORT: FROMLIST:`
-    - Example:
-```
-        FROMLIST: important patch from upstream
+1. 获取官方 common 最新提交。
+2. 强制更新独立的官方跟踪分支。
+3. 检查官方上游与 `6.6-final` 是否存在共同祖先。
+4. 有共同祖先且普通合并无文本冲突时，创建 `sync/upstream-*` 候选分支和 Draft PR。
+5. 无共同祖先或存在冲突时停止，并保存同步报告。
+6. 永不自动合并 `6.6-final`。
 
-        This is the detailed description of the important patch
+详细规则见 [`UPSTREAM.md`](UPSTREAM.md)。
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+## 正确的完整构建方式
 
-        Bug: 135791357
-        Link: https://lore.kernel.org/lkml/20190619171517.GA17557@someone.com/
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+本仓库不提供独立正式构建入口。完整构建应在 OnePlusOSS OKI 工作区中进行：
 
-- If a patch has been submitted to the community, but rejected, do NOT use the
-  `FROMLIST:` tag to try to hide this fact.  Use the `ANDROID:` tag as
-  described below as this must be considered as an Android-specific submission,
-  not an upstream submission as the community will not accept these changes
-  as-is.
+```bash
+repo init \
+  -u https://github.com/OnePlusOSS/kernel_manifest.git \
+  -b oneplus/sm8750 \
+  -m oneplus_13_b.xml
 
-## Requirements for Android-specific patches: `ANDROID:`
+repo sync -c --force-sync --no-clone-bundle --no-tags -j"$(nproc)"
+repo manifest -r -o manifest-pinned.xml
 
-- If the patch is fixing a bug to Android-specific code
-    - tag the patch subject with `ANDROID:`
-    - add a `Fixes:` tag that cites the patch with the bug
-    - Example:
-```
-        ANDROID: fix android-specific bug in foobar.c
-
-        This is the detailed description of the important fix
-
-        Fixes: 1234abcd2468 ("foobar: add cool feature")
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+./kernel_platform/oplus/build/oplus_build_kernel.sh sun perf
 ```
 
-- If the patch is a new feature
-    - tag the patch subject with `ANDROID:`
-    - add a `Bug:` tag with the Android bug (required for android-specific features)
+需要测试本仓库改动时，应在固定 manifest 的完整工作区内，将 `kernel_platform/common` 指向经过审核的本仓库提交，再重新进行完整构建。
 
+## 合并前检查
+
+每个上游同步候选至少需要：
+
+- [ ] 记录官方 common 提交 SHA
+- [ ] 保存完整 `manifest-pinned.xml`
+- [ ] 核对 common 与 msm-kernel / modules / DT 的版本匹配
+- [ ] 逐项审核本地调度、ZRAM、Root、网络和安全补丁
+- [ ] 完整 OKI clean build 成功
+- [ ] Image、vendor_boot 与 vendor modules 的 vermagic / ABI 匹配
+- [ ] OnePlus 13 / 对应 ColorOS 版本可重复启动
+- [ ] 蜂窝、Wi-Fi、蓝牙、相机、指纹、充电和休眠通过测试
+- [ ] Root、SuSFS、调度和网络功能通过测试
+- [ ] 回退包和恢复路径可用
+
+## 分支策略
+
+| 分支 | 用途 |
+|---|---|
+| `6.6-final` | 当前自定义 common 开发基线 |
+| `upstream/oneplus-sm8750-b-16.0.0-oneplus-13` | 官方 common 只读镜像 |
+| `sync/upstream-*` | 自动生成的上游合并候选 |
+| `fix/*` | 单一问题修复 |
+| `feature/*` | 独立功能开发 |
+
+## 禁止事项
+
+- 不把本仓库当作完整 OKI 工程。
+- 不直接把单独编译的 Image 标记为可刷写稳定包。
+- 不使用 `ours`、整树覆盖或删除冲突代码伪造同步成功。
+- 不把空 Kconfig / Makefile stub 构建当作正式产物。
+- 不在未核对 vendor_boot、vendor modules 和 ABI 时刷入。
+- 不提交 Token、Cookie、密钥、账号、设备序列号、未脱敏日志或本机绝对路径。
+
+## 验证等级
+
+- **Experimental**：源码可合并或可编译，但未完成真机启动。
+- **Boot Verified**：指定 PJZ110 / ColorOS 版本可以重复启动并可回退。
+- **Runtime Verified**：关键硬件与内核功能通过测试。
+- **Stable**：完成重复刷写、重启、待机和基础回归。
+
+## 许可证
+
+Linux 内核源码遵循 GPL-2.0。第三方补丁遵循各自许可证和来源要求。

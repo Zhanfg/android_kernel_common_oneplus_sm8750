@@ -1,0 +1,231 @@
+name: Sync OnePlus 13 Official Common Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "35 3 * * 0"
+  push:
+    branches: ["6.6-final"]
+    paths:
+      - ".github/workflows/sync-upstream.yml"
+      - "UPSTREAM.md"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: oneplus13-common-upstream-sync
+  cancel-in-progress: false
+
+env:
+  LOCAL_BRANCH: 6.6-final
+  UPSTREAM_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git
+  UPSTREAM_BRANCH: oneplus/sm8750_b_16.0.0_oneplus_13
+  TRACKING_BRANCH: upstream/oneplus-sm8750-b-16.0.0-oneplus-13
+
+jobs:
+  sync:
+    if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout custom common branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.LOCAL_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure Git and fetch official upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "${UPSTREAM_REPO}"
+          git fetch --no-tags --prune upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+      - name: Update official tracking branch and build candidate
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_REF="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_REF}")"
+          LOCAL_SHORT="${LOCAL_SHA:0:12}"
+          UPSTREAM_SHORT="${UPSTREAM_SHA:0:12}"
+          SYNC_DATE="$(date -u +%Y%m%d)"
+          SYNC_BRANCH="sync/upstream-${SYNC_DATE}-${UPSTREAM_SHORT}-${LOCAL_SHORT}"
+          REPORT="upstream-sync-report.md"
+
+          echo "local_sha=${LOCAL_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "sync_branch=${SYNC_BRANCH}" >> "${GITHUB_OUTPUT}"
+
+          set_outputs() {
+            echo "result=$1" >> "${GITHUB_OUTPUT}"
+            echo "conflict=$2" >> "${GITHUB_OUTPUT}"
+          }
+
+          kernel_version() {
+            git show "$1:Makefile" 2>/dev/null | awk '
+              /^VERSION =/ {v=$3}
+              /^PATCHLEVEL =/ {p=$3}
+              /^SUBLEVEL =/ {s=$3; print v "." p "." s; exit}
+            '
+          }
+
+          LOCAL_VERSION="$(kernel_version "${LOCAL_SHA}" || true)"
+          UPSTREAM_VERSION="$(kernel_version "${UPSTREAM_SHA}" || true)"
+
+          {
+            echo "# OnePlus 13 common upstream sync report"
+            echo
+            echo "- Local branch: \`${LOCAL_BRANCH}\`"
+            echo "- Local SHA: \`${LOCAL_SHA}\`"
+            echo "- Local kernel: \`${LOCAL_VERSION:-unknown}\`"
+            echo "- Official repository: \`OnePlusOSS/android_kernel_common_oneplus_sm8750\`"
+            echo "- Official branch: \`${UPSTREAM_BRANCH}\`"
+            echo "- Official SHA: \`${UPSTREAM_SHA}\`"
+            echo "- Official kernel: \`${UPSTREAM_VERSION:-unknown}\`"
+            echo "- Tracking branch: \`${TRACKING_BRANCH}\`"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+          } > "${REPORT}"
+
+          # This branch is an exact mirror of the floating official branch.
+          git push --force origin \
+            "${UPSTREAM_REF}:refs/heads/${TRACKING_BRANCH}"
+
+          MERGE_BASE="$(git merge-base "${LOCAL_SHA}" "${UPSTREAM_SHA}" 2>/dev/null || true)"
+          echo "- Common ancestor: \`${MERGE_BASE:-none}\`" >> "${REPORT}"
+          echo >> "${REPORT}"
+
+          if [ -z "${MERGE_BASE}" ]; then
+            {
+              echo "## Result"
+              echo
+              echo "The official tracking branch was updated, but the custom branch and official branch have no common Git ancestor."
+              echo
+              echo "No merge candidate or pull request was created. Establish or document the imported baseline, then replay local feature groups manually."
+            } >> "${REPORT}"
+            cat "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+            set_outputs "no-common-history" "true"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "${UPSTREAM_SHA}" "${LOCAL_SHA}"; then
+            {
+              echo "## Result"
+              echo
+              echo "The custom branch already contains the selected official upstream commit."
+            } >> "${REPORT}"
+            cat "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+            set_outputs "up-to-date" "false"
+            exit 0
+          fi
+
+          git switch -c "${SYNC_BRANCH}" "${LOCAL_SHA}"
+          set +e
+          git merge --no-ff --no-edit "${UPSTREAM_SHA}"
+          STATUS=$?
+          set -e
+
+          if [ "${STATUS}" -ne 0 ]; then
+            CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+            {
+              echo "## Result"
+              echo
+              echo "A normal Git merge produced conflicts. Nothing was pushed to a candidate branch."
+              echo
+              echo "## Conflicting files"
+              echo
+              if [ -n "${CONFLICTS}" ]; then
+                while IFS= read -r file; do
+                  echo "- \`${file}\`"
+                done <<< "${CONFLICTS}"
+              else
+                echo "- Git stopped before producing an unmerged-file list."
+              fi
+            } >> "${REPORT}"
+            git merge --abort 2>/dev/null || true
+            cat "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+            set_outputs "merge-conflict" "true"
+            exit 0
+          fi
+
+          CHANGE_COUNT="$(git diff --name-only "${LOCAL_SHA}" HEAD | awk 'END {print NR + 0}')"
+          {
+            echo "## Result"
+            echo
+            echo "A clean textual merge candidate was created. It still requires complete OKI build and device validation."
+            echo
+            echo "- Candidate branch: \`${SYNC_BRANCH}\`"
+            echo "- Files changed relative to local base: ${CHANGE_COUNT}"
+            echo
+            echo "## First 200 changed paths"
+            echo
+            git diff --name-only "${LOCAL_SHA}" HEAD | sed -n '1,200p' | while IFS= read -r file; do
+              echo "- \`${file}\`"
+            done
+          } >> "${REPORT}"
+
+          git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          cat "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+          set_outputs "clean-candidate" "false"
+
+      - name: Upload sync report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13-common-upstream-report-${{ github.run_id }}
+          path: upstream-sync-report.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Create Draft pull request
+        if: steps.sync.outputs.result == 'clean-candidate'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
+          LOCAL_SHA: ${{ steps.sync.outputs.local_sha }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXISTING="$(gh pr list --base "${LOCAL_BRANCH}" --head "${SYNC_BRANCH}" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "${EXISTING}" ]; then
+            echo "Existing PR: ${EXISTING}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          cat > /tmp/upstream-pr-body.md <<EOF
+          ## Official upstream
+
+          - Repository: \`OnePlusOSS/android_kernel_common_oneplus_sm8750\`
+          - Branch: \`${UPSTREAM_BRANCH}\`
+          - Official SHA: \`${UPSTREAM_SHA}\`
+          - Local base: \`${LOCAL_SHA}\`
+
+          ## Required validation
+
+          This PR is only a textual merge candidate. Keep it Draft until a pinned full OnePlus OKI manifest builds successfully and OnePlus 13 boot, ABI, vendor modules, cellular, Wi-Fi, camera, fingerprint, charging, sleep, Root, SuSFS, scheduling and networking are reviewed.
+          EOF
+
+          gh pr create \
+            --draft \
+            --base "${LOCAL_BRANCH}" \
+            --head "${SYNC_BRANCH}" \
+            --title "chore: sync OnePlus 13 official common upstream" \
+            --body-file /tmp/upstream-pr-body.md
+
+      - name: Fail when manual migration is required
+        if: steps.sync.outputs.conflict == 'true'
+        run: |
+          echo "The official tracking branch was updated, but automatic integration requires manual review."
+          exit 1
