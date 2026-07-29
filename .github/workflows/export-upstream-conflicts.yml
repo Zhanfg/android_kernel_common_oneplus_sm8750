@@ -1,0 +1,147 @@
+name: Export OnePlus 13 Upstream Conflicts
+
+on:
+  pull_request:
+    branches: ["6.6-final"]
+    paths:
+      - "sync/UPSTREAM_CONFLICT_REQUEST.md"
+      - ".github/workflows/export-upstream-conflicts.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus13-export-upstream-conflicts
+  cancel-in-progress: true
+
+env:
+  LOCAL_BRANCH: 6.6-final
+  OFFICIAL_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git
+  OFFICIAL_BRANCH: oneplus/sm8750_b_16.0.0_oneplus_13
+  OFFICIAL_SHA: e1b346b6b4f4096eb342ae3684838a942fd6f6c4
+
+jobs:
+  export:
+    if: github.repository == 'Zhanfg/android_kernel_common_oneplus_sm8750'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout custom common
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.LOCAL_BRANCH }}
+          fetch-depth: 0
+          filter: blob:none
+          show-progress: false
+
+      - name: Merge official tip and export conflict stages
+        id: export
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove official 2>/dev/null || true
+          git remote add official "${OFFICIAL_REPO}"
+          git fetch --filter=blob:none --no-tags --no-recurse-submodules official \
+            "+${OFFICIAL_SHA}:refs/remotes/official/pinned"
+
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          MERGE_BASE="$(git merge-base "${LOCAL_SHA}" "${OFFICIAL_SHA}")"
+
+          rm -rf conflict-bundle
+          mkdir -p conflict-bundle/{base,ours,theirs,merged,index}
+
+          set +e
+          git merge --no-commit --no-ff "${OFFICIAL_SHA}"
+          MERGE_STATUS=$?
+          set -e
+
+          git diff --name-only --diff-filter=U | LC_ALL=C sort -u > conflict-bundle/conflicts.txt
+          CONFLICT_COUNT="$(awk 'END {print NR + 0}' conflict-bundle/conflicts.txt)"
+
+          {
+            echo "LOCAL_BRANCH=${LOCAL_BRANCH}"
+            echo "LOCAL_SHA=${LOCAL_SHA}"
+            echo "OFFICIAL_BRANCH=${OFFICIAL_BRANCH}"
+            echo "OFFICIAL_SHA=${OFFICIAL_SHA}"
+            echo "MERGE_BASE=${MERGE_BASE}"
+            echo "MERGE_STATUS=${MERGE_STATUS}"
+            echo "CONFLICT_COUNT=${CONFLICT_COUNT}"
+          } > conflict-bundle/metadata.env
+
+          git status --short > conflict-bundle/status.txt || true
+          git diff --cc --binary > conflict-bundle/combined-conflicts.diff || true
+          git diff --stat > conflict-bundle/merge-stat.txt || true
+
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+
+            for stage in 1 2 3; do
+              case "${stage}" in
+                1) dir=base ;;
+                2) dir=ours ;;
+                3) dir=theirs ;;
+              esac
+              mkdir -p "conflict-bundle/${dir}/$(dirname "${path}")"
+              if git cat-file -e ":${stage}:${path}" 2>/dev/null; then
+                git show ":${stage}:${path}" > "conflict-bundle/${dir}/${path}"
+              else
+                printf 'MISSING_AT_STAGE_%s\n' "${stage}" > "conflict-bundle/${dir}/${path}.missing"
+              fi
+            done
+
+            mkdir -p "conflict-bundle/merged/$(dirname "${path}")"
+            if [ -e "${path}" ] || [ -L "${path}" ]; then
+              cp -a -- "${path}" "conflict-bundle/merged/${path}"
+            else
+              printf 'MISSING_IN_WORKTREE\n' > "conflict-bundle/merged/${path}.missing"
+            fi
+
+            mkdir -p "conflict-bundle/index/$(dirname "${path}")"
+            git ls-files -u -- "${path}" > "conflict-bundle/index/${path}.stages"
+          done < conflict-bundle/conflicts.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
+          import json
+
+          paths = [p for p in Path('conflict-bundle/conflicts.txt').read_text().splitlines() if p]
+          counts = Counter(p.split('/', 1)[0] if '/' in p else '(root)' for p in paths)
+          Path('conflict-bundle/summary.json').write_text(
+              json.dumps({'count': len(paths), 'by_top_level': dict(sorted(counts.items())), 'paths': paths}, indent=2),
+              encoding='utf-8',
+          )
+          PY
+
+          {
+            echo "# OnePlus 13 16.0.9.401 conflict export"
+            echo
+            echo "- Local SHA: \`${LOCAL_SHA}\`"
+            echo "- Official SHA: \`${OFFICIAL_SHA}\`"
+            echo "- Merge base: \`${MERGE_BASE}\`"
+            echo "- Conflicts: ${CONFLICT_COUNT}"
+            echo
+            echo "The artifact contains base, ours, theirs and conflict-marker versions for every unresolved path."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "conflict_count=${CONFLICT_COUNT}" >> "${GITHUB_OUTPUT}"
+
+          git merge --abort 2>/dev/null || true
+
+      - name: Upload conflict bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13-common-16.0.9.401-conflicts-${{ github.run_id }}
+          path: conflict-bundle
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Require manual resolution
+        if: steps.export.outputs.conflict_count != '0'
+        run: |
+          echo "Conflict bundle exported. Manual per-file resolution is required."
+          exit 1
