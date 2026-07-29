@@ -1,0 +1,28 @@
+{
+  "kernel/fork.c": [
+    "ours",
+    "ours",
+    {
+      "custom": "#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n\ttrace_android_vh_put_task(tsk);\n"
+    },
+    "ours",
+    "ours"
+  ],
+  "kernel/sched/build_policy.c": [
+    "theirs",
+    "ours"
+  ],
+  "kernel/sched/fair.c": [
+    "ours",
+    "theirs"
+  ],
+  "kernel/sched/sched.h": [
+    {
+      "custom": "static inline int normal_policy(int policy)\n{\n#ifdef CONFIG_HMBIRD_SCHED\n\tif (policy == SCHED_HMBIRD)\n\t\treturn true;\n#endif\n\treturn policy == SCHED_NORMAL;\n}\n\nstatic inline int fair_policy(int policy)\n{\n\treturn normal_policy(policy) || policy == SCHED_BATCH;\n"
+    },
+    "theirs",
+    "theirs",
+    "theirs",
+    "ours"
+  ]
+}
